@@ -163,7 +163,7 @@ export default function App(){
         {tab==="blotter"&&<Blotter operations={operations} setOperations={setOperations} fxOps={fxOps} setFxOps={setFxOps} allTickers={allTickers}/>}
         {tab==="auditoria"&&<Auditoria operations={operations} fxOps={fxOps}/>}
         {tab==="instrumentos"&&<BaseInstrumentos instruments={instruments} setInstruments={setInstruments}/>}
-        {tab==="posicion"&&<Placeholder name="Posición & PNL"/>}
+        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps}/>}
         {tab==="mercado"&&<Mercado/>}
       </main>
     </div>
@@ -173,12 +173,12 @@ export default function App(){
 // ============================================================
 // DASHBOARD
 // ============================================================
-function Dashboard({operations}){
+function Dashboard({operations,fxOps}){
   const today=fmtD(new Date());
   const selDate=isBusinessDay(today)?today:getNextBusinessDay(today);
   const nextBD=getNextBusinessDay(selDate);
 
-  const compute=(ops)=>{
+  const compute=(ops,fxList)=>{
     const cash={ARS:0,MEP:0,CCL:0};
     const bonds={};
     for(const op of ops){
@@ -187,19 +187,28 @@ function Dashboard({operations}){
       const vnDelta=op.type==="COMPRA"?op.vn:-op.vn;
       bonds[op.ticker]=(bonds[op.ticker]||0)+vnDelta;
     }
+    // FX impact on cash
+    for(const fx of fxList){
+      if(fx.ars) cash.ARS+=fx.ars;
+      if(fx.usd_mep) cash.MEP+=fx.usd_mep;
+      if(fx.usd_cable) cash.CCL+=fx.usd_cable;
+    }
     return{cash,bonds};
   };
 
   // T+0: ops dated today with plazo 0
   const opsT0=operations.filter(o=>o.date===selDate&&o.plazo==="0");
-  // T+1: ops dated today with plazo 1 (will settle nextBD)
+  const fxT0=(fxOps||[]).filter(o=>o.date===selDate&&o.plazo==="0");
+  // T+1: ops dated today with plazo 1
   const opsT1=operations.filter(o=>o.date===selDate&&o.plazo==="1");
-  // Maturity: ALL ops up to and including today (all plazos)
+  const fxT1=(fxOps||[]).filter(o=>o.date===selDate&&o.plazo==="1");
+  // Maturity: ALL ops up to and including today
   const allOps=operations.filter(o=>o.date<=selDate);
+  const allFx=(fxOps||[]).filter(o=>o.date<=selDate);
 
-  const maturity=compute(allOps);
-  const t0data=compute(opsT0);
-  const t1data=compute(opsT1);
+  const maturity=compute(allOps,allFx);
+  const t0data=compute(opsT0,fxT0);
+  const t1data=compute(opsT1,fxT1);
 
   const usH=US_HOLIDAY_MAP.get(selDate);
   const usE=US_EARLY_MAP.get(selDate);
@@ -923,16 +932,29 @@ function BaseInstrumentos({instruments,setInstruments}){
 // ============================================================
 // AUDITORÍA
 // ============================================================
-function Auditoria({operations}){
+function Auditoria({operations,fxOps}){
   const today=fmtD(new Date());
   const[fromDate,setFromDate]=useState(today);
   const[toDate,setToDate]=useState(today);
-  const[view,setView]=useState(null);// null | "ops"
+  const[view,setView]=useState(null);
 
+  // Merge titles + FX into a unified list
   const filtered=useMemo(()=>{
     if(!fromDate||!toDate)return[];
-    return operations.filter(o=>o.date>=fromDate&&o.date<=toDate).sort((a,b)=>a.date.localeCompare(b.date));
-  },[operations,fromDate,toDate]);
+    const titleOps=operations.filter(o=>o.date>=fromDate&&o.date<=toDate).map(o=>({...o,source:"titulo"}));
+    const fxList=(fxOps||[]).filter(o=>o.date>=fromDate&&o.date<=toDate).map(o=>{
+      // Build a unified row for FX
+      const ticker=o.fxType==="CCL"?"Cable":o.fxType;
+      let montoStr="";
+      if(o.fxType==="CANJE"){
+        montoStr=`Cable: ${fmtNum(Math.round(o.usd_cable||0))} / MEP: ${fmtNum(Math.round(o.usd_mep||0))}`;
+      }else{
+        montoStr=fmtMoney(o.ars||0);
+      }
+      return{...o,source:"fx",ticker,type:o.tipo,monto:o.ars||0,currency:"USD",montoDisplay:montoStr};
+    });
+    return[...titleOps,...fxList].sort((a,b)=>a.date.localeCompare(b.date));
+  },[operations,fxOps,fromDate,toDate]);
 
   const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
@@ -941,17 +963,15 @@ function Auditoria({operations}){
     <div>
       <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Consultá operaciones registradas por rango de fechas</div>
 
-      {/* Date range selector */}
+      {/* Date range with DatePicker (DD/MM/AAAA) */}
       <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:20,flexWrap:"wrap"}}>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <label style={{fontSize:11,color:"#718096",textTransform:"uppercase",letterSpacing:"1px"}}>Desde</label>
-          <input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)}
-            style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none"}}/>
+          <DatePicker value={fromDate} onChange={setFromDate}/>
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <label style={{fontSize:11,color:"#718096",textTransform:"uppercase",letterSpacing:"1px"}}>Hasta</label>
-          <input type="date" value={toDate} onChange={e=>setToDate(e.target.value)}
-            style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none"}}/>
+          <DatePicker value={toDate} onChange={setToDate}/>
         </div>
         <button onClick={()=>setView("ops")} style={{padding:"8px 20px",borderRadius:8,border:"none",background:"#3182ce",color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
           Ver operaciones
@@ -963,7 +983,6 @@ function Auditoria({operations}){
         )}
       </div>
 
-      {/* Results */}
       {view==="ops"&&(
         <div>
           <div style={{marginBottom:12,fontSize:12,color:"#718096"}}>
@@ -981,9 +1000,9 @@ function Auditoria({operations}){
                   <tr>
                     <th style={hdS}>F. Concertación</th>
                     <th style={hdS}>F. Liquidación</th>
+                    <th style={hdS}>Origen</th>
                     <th style={hdS}>Ticker</th>
                     <th style={hdS}>Tipo</th>
-                    <th style={hdS}>Moneda</th>
                     <th style={{...hdS,textAlign:"right"}}>VN</th>
                     <th style={{...hdS,textAlign:"right"}}>PX</th>
                     <th style={{...hdS,textAlign:"right"}}>Monto</th>
@@ -993,44 +1012,167 @@ function Auditoria({operations}){
                   {filtered.map((op,i)=>{
                     const fConc=fmtDD(op.date);
                     const fLiq=op.plazo==="0"?fmtDD(op.date):fmtDD(getNextBusinessDay(op.date));
-                    const isC=op.type==="COMPRA";
+                    const isC=(op.type||op.tipo)==="COMPRA";
+                    const isFx=op.source==="fx";
                     return(
                       <tr key={op.id||i} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                         <td style={cellS}>{fConc}</td>
                         <td style={cellS}>{fLiq}</td>
+                        <td style={cellS}>
+                          <span style={{fontSize:9,padding:"2px 6px",borderRadius:3,fontWeight:700,background:isFx?"rgba(237,137,54,0.12)":"rgba(99,179,237,0.12)",color:isFx?"#ed8936":"#63b3ed"}}>{isFx?"FX":"Título"}</span>
+                        </td>
                         <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{op.ticker}</td>
                         <td style={cellS}>
-                          <span style={{padding:"3px 10px",borderRadius:4,fontSize:10,fontWeight:600,background:isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)",color:isC?"#68d391":"#fc8181"}}>{op.type}</span>
-                        </td>
-                        <td style={cellS}>
-                          <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700,background:op.currency==="ARS"?"rgba(99,179,237,0.1)":op.currency==="MEP"?"rgba(72,187,120,0.1)":"rgba(237,137,54,0.1)",color:op.currency==="ARS"?"#63b3ed":op.currency==="MEP"?"#68d391":"#ed8936"}}>{op.currency}</span>
+                          <span style={{padding:"3px 10px",borderRadius:4,fontSize:10,fontWeight:600,background:isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)",color:isC?"#68d391":"#fc8181"}}>{op.type||op.tipo}</span>
                         </td>
                         <td style={{...cellS,textAlign:"right"}}>{fmtNum(op.vn)}</td>
-                        <td style={{...cellS,textAlign:"right"}}>{Number(op.px).toFixed(2)}</td>
-                        <td style={{...cellS,textAlign:"right",fontWeight:600,color:op.monto>=0?"#68d391":"#fc8181"}}>{fmtMoney(op.monto)}</td>
+                        <td style={{...cellS,textAlign:"right"}}>{isFx&&op.fxType==="CANJE"?Number(op.px).toFixed(2)+"%":Number(op.px).toFixed(2)}</td>
+                        <td style={{...cellS,textAlign:"right",fontWeight:600,color:isFx?"#a0aec0":(op.monto>=0?"#68d391":"#fc8181")}}>
+                          {isFx?(op.montoDisplay||"\u2014"):fmtMoney(op.monto)}
+                        </td>
                       </tr>
                     );
                   })}
                 </tbody>
               </table>
-
-              {/* Totals */}
-              <div style={{padding:"12px 20px",background:"#0d1220",borderTop:"1px solid rgba(99,179,237,0.1)",display:"flex",justifyContent:"flex-end",gap:24}}>
-                {["ARS","MEP","CCL"].map(cur=>{
-                  const total=filtered.filter(o=>o.currency===cur).reduce((s,o)=>s+o.monto,0);
-                  if(total===0)return null;
-                  return(
-                    <div key={cur} style={{fontSize:12,display:"flex",alignItems:"center",gap:6}}>
-                      <span style={{fontSize:10,fontWeight:700,color:cur==="ARS"?"#63b3ed":cur==="MEP"?"#68d391":"#ed8936"}}>{cur}</span>
-                      <span style={{fontWeight:600,color:total>=0?"#68d391":"#fc8181"}}>{fmtMoney(total)}</span>
-                    </div>
-                  );
-                })}
-              </div>
             </div>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================
+// POSICIÓN & PNL — Consolidated position across all dates
+// ============================================================
+function PosicionPNL({operations,fxOps}){
+  // Consolidate ALL title operations into net position per ticker
+  const positions=useMemo(()=>{
+    const pos={};// ticker -> {vn, compras, ventas, avgPx, currency, family}
+    for(const op of operations){
+      const key=op.ticker;
+      if(!pos[key])pos[key]={ticker:key,currency:op.currency||"ARS",vnNet:0,vnCompra:0,vnVenta:0,montoTotal:0};
+      if(op.type==="COMPRA"){
+        pos[key].vnNet+=op.vn;
+        pos[key].vnCompra+=op.vn;
+      }else{
+        pos[key].vnNet-=op.vn;
+        pos[key].vnVenta+=op.vn;
+      }
+      pos[key].montoTotal+=op.monto;
+    }
+    return Object.values(pos).filter(p=>p.vnNet!==0||p.vnCompra>0||p.vnVenta>0).sort((a,b)=>a.ticker.localeCompare(b.ticker));
+  },[operations]);
+
+  // FX consolidated
+  const fxPos=useMemo(()=>{
+    const saldos={ARS:0,MEP:0,Cable:0};
+    for(const fx of(fxOps||[])){
+      if(fx.ars)saldos.ARS+=fx.ars;
+      if(fx.usd_mep)saldos.MEP+=fx.usd_mep;
+      if(fx.usd_cable)saldos.Cable+=fx.usd_cable;
+    }
+    return saldos;
+  },[fxOps]);
+
+  // Cash from title operations
+  const cashFromTitles=useMemo(()=>{
+    const cash={ARS:0,MEP:0,CCL:0};
+    for(const op of operations){
+      const cur=op.currency||"ARS";
+      if(cash[cur]!==undefined)cash[cur]+=op.monto;
+    }
+    return cash;
+  },[operations]);
+
+  const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
+  return(
+    <div>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Posición consolidada global — todas las operaciones acumuladas</div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20,marginBottom:24}}>
+        {/* Cash position from titles + FX */}
+        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)"}}>
+          <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
+            Saldo Cash
+          </div>
+          <div style={{padding:"16px 20px"}}>
+            {[
+              {label:"ARS",val:cashFromTitles.ARS+fxPos.ARS,color:"#63b3ed"},
+              {label:"USD MEP",val:cashFromTitles.MEP+fxPos.MEP,color:"#68d391"},
+              {label:"USD Cable",val:cashFromTitles.CCL+fxPos.Cable,color:"#ed8936"},
+            ].map(r=>(
+              <div key={r.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
+                <span style={{fontSize:12,fontWeight:600,color:r.color}}>{r.label}</span>
+                <span style={{fontSize:16,fontWeight:700,fontVariantNumeric:"tabular-nums",color:r.val===0?"#4a5568":r.val>0?"#68d391":"#fc8181"}}>
+                  {r.val===0?"0":fmtMoney(r.val)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* FX position detail */}
+        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)"}}>
+          <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
+            Posición FX neta
+          </div>
+          <div style={{padding:"16px 20px"}}>
+            {Object.entries(fxPos).map(([k,v])=>(
+              <div key={k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
+                <span style={{fontSize:12,fontWeight:600,color:"#a0aec0"}}>{k}</span>
+                <span style={{fontSize:16,fontWeight:700,fontVariantNumeric:"tabular-nums",color:v===0?"#4a5568":v>0?"#68d391":"#fc8181"}}>
+                  {v===0?"0":fmtMoney(v)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Titles position table */}
+      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
+          Posición en Títulos (VN neto)
+        </div>
+        {positions.length===0?(
+          <div style={{padding:"30px 20px",textAlign:"center",color:"#4a5568",fontSize:13}}>Sin posiciones abiertas</div>
+        ):(
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead>
+              <tr>
+                <th style={hdS}>Ticker</th>
+                <th style={hdS}>Moneda</th>
+                <th style={{...hdS,textAlign:"right"}}>VN Comprado</th>
+                <th style={{...hdS,textAlign:"right"}}>VN Vendido</th>
+                <th style={{...hdS,textAlign:"right"}}>VN Neto</th>
+                <th style={{...hdS,textAlign:"right"}}>Monto Neto</th>
+              </tr>
+            </thead>
+            <tbody>
+              {positions.map(p=>(
+                <tr key={p.ticker} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                  <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{p.ticker}</td>
+                  <td style={cellS}>
+                    <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700,background:p.currency==="ARS"?"rgba(99,179,237,0.1)":p.currency==="MEP"?"rgba(72,187,120,0.1)":"rgba(237,137,54,0.1)",color:p.currency==="ARS"?"#63b3ed":p.currency==="MEP"?"#68d391":"#ed8936"}}>{p.currency}</span>
+                  </td>
+                  <td style={{...cellS,textAlign:"right",color:"#68d391"}}>{p.vnCompra>0?"+"+fmtNum(p.vnCompra):"\u2014"}</td>
+                  <td style={{...cellS,textAlign:"right",color:"#fc8181"}}>{p.vnVenta>0?"-"+fmtNum(p.vnVenta):"\u2014"}</td>
+                  <td style={{...cellS,textAlign:"right",fontWeight:700,fontSize:14,color:p.vnNet>0?"#68d391":p.vnNet<0?"#fc8181":"#4a5568"}}>
+                    {p.vnNet>0?"+":""}{fmtNum(p.vnNet)}
+                  </td>
+                  <td style={{...cellS,textAlign:"right",fontWeight:600,color:p.montoTotal>=0?"#68d391":"#fc8181"}}>
+                    {fmtMoney(p.montoTotal)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   );
 }
