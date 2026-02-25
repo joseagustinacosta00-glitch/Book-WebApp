@@ -139,6 +139,18 @@ def byma_bonds(q: str = Query("", description="Filter text"), limit: int = Query
     }
 
 
+@app.get("/api/byma/cauciones")
+def byma_cauciones(max_days: int = Query(7)):
+    """Cauciones (repos) data from Open BYMA, parsed by currency."""
+    return byma.get_cauciones_parsed(max_days)
+
+
+@app.get("/api/byma/cauciones/raw")
+def byma_cauciones_raw():
+    """Raw cauciones data for debugging field names."""
+    return byma.raw_caucion()
+
+
 # ── Serve Frontend Static Files ──────────────────────────────
 DIST_DIR = Path(__file__).parent / "dist"
 

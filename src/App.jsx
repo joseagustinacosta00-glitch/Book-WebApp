@@ -973,7 +973,7 @@ function BaseInstrumentos({instruments,setInstruments}){
                 <div style={{fontSize:10,color:"#ed8936",fontWeight:600,marginBottom:8}}>⏱️ Precios BYMA Open (delay ~20 min)</div>
                 <table style={{width:"100%",borderCollapse:"collapse"}}>
                   <thead><tr>
-                    <th style={hdS}>Ticker</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={{...hdS,textAlign:"right"}}>Bid</th><th style={{...hdS,textAlign:"right"}}>Offer</th><th style={{...hdS,textAlign:"right"}}>Vol VN</th><th style={{...hdS,textAlign:"right"}}>Monto</th><th style={{...hdS,textAlign:"center",width:30}}></th>
+                    <th style={hdS}>Ticker</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={{...hdS,textAlign:"right"}}>Bid</th><th style={{...hdS,textAlign:"right"}}>Offer</th><th style={{...hdS,textAlign:"right"}}>VWAP</th><th style={{...hdS,textAlign:"right"}}>Vol VN</th><th style={{...hdS,textAlign:"right"}}>Monto</th><th style={{...hdS,textAlign:"center",width:30}}></th>
                   </tr></thead>
                   <tbody>
                     {instruments[fam].map(inst=>{
@@ -984,6 +984,7 @@ function BaseInstrumentos({instruments,setInstruments}){
                         <td style={{...cellS,textAlign:"right",color:q.last!=null?"#f6e05e":"#4a5568"}}>{fP(q.last)}</td>
                         <td style={{...cellS,textAlign:"right",color:q.bid!=null?"#48bb78":"#4a5568"}}>{fP(q.bid)}</td>
                         <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fP(q.offer)}</td>
+                        <td style={{...cellS,textAlign:"right",color:q.vwap!=null?"#b794f4":"#4a5568",fontWeight:q.vwap!=null?600:400}}>{fP(q.vwap)}</td>
                         <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"—"}</td>
                         <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):"—"}</td>
                         <td style={{...cellS,textAlign:"center"}}>{q.error?<span title={q.error} style={{color:"#fc8181",cursor:"help",fontSize:10}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78",fontSize:10}}>✓</span>:"—"}</td>
@@ -1339,187 +1340,267 @@ function fmtARTime(d){
 }
 
 function Mercado(){
-  const curveKeys=Object.keys(curves);
+  const curveKeys=[...Object.keys(curves),"tasa"];
+  const curveLabels={...Object.fromEntries(Object.keys(curves).map(k=>[k,curves[k].label])),tasa:"Tasas"};
   const[activeCurve,setActiveCurve]=useState(curveKeys[0]);
   const[quotes,setQuotes]=useState({});
   const[status,setStatus]=useState("idle");
   const[errorMsg,setErrorMsg]=useState("");
-  const[intervalIdx,setIntervalIdx]=useState(1);// default 5 min
+  const[intervalIdx,setIntervalIdx]=useState(1);
   const[lastUpdate,setLastUpdate]=useState(null);
   const[mktOpen,setMktOpen]=useState(isMarketOpen());
-  const[source,setSource]=useState("rofex");// "rofex" | "byma"
+  const[source,setSource]=useState("rofex");
+  const[cauciones,setCauciones]=useState(null);
+  const[caucionLoading,setCaucionLoading]=useState(false);
   const timerRef=useRef(null);
   const mktCheckRef=useRef(null);
 
+  const isTasa=activeCurve==="tasa";
+  const isByma=source==="byma";
+
   const fetchQuotes=async()=>{
+    if(isTasa){fetchCauciones();return;}
     const syms=curves[activeCurve].symbols.map(s=>s.rofexTicker).join(",");
     if(!syms)return;
-    setStatus("loading");
-    setErrorMsg("");
+    setStatus("loading");setErrorMsg("");
     try{
-      const endpoint=source==="byma"?"/api/byma/quotes":"/api/quotes";
+      const endpoint=isByma?"/api/byma/quotes":"/api/quotes";
       const r=await fetch(endpoint+"?symbols="+encodeURIComponent(syms));
       const data=await r.json();
       const symsData=data.symbols||{};
-      setQuotes(symsData);
-      setLastUpdate(new Date());
-
+      setQuotes(symsData);setLastUpdate(new Date());
       const vals=Object.values(symsData);
       const allErrors=vals.length>0&&vals.every(v=>v.error);
-      if(allErrors){
-        setStatus("error");
-        setErrorMsg(vals[0]?.error||"Error desconocido");
-        return;
-      }
+      if(allErrors){setStatus("error");setErrorMsg(vals[0]?.error||"Error desconocido");return;}
       setStatus("ok");
-    }catch(e){
-      console.warn("fetch error",e);
-      setStatus("error");
-      setErrorMsg(e.message||"Error de conexión");
-    }
+    }catch(e){setStatus("error");setErrorMsg(e.message||"Error de conexión");}
   };
 
-  // Check market open/closed every 30s
+  const fetchCauciones=async()=>{
+    setCaucionLoading(true);setErrorMsg("");setStatus("loading");
+    try{
+      const r=await fetch("/api/byma/cauciones?max_days=7");
+      const data=await r.json();
+      setCauciones(data);setLastUpdate(new Date());
+      setStatus((data.ars&&data.ars.length>0)||(data.usd&&data.usd.length>0)?"ok":"error");
+      if(data.error)setErrorMsg(data.error);
+    }catch(e){setStatus("error");setErrorMsg(e.message||"Error de conexión");}
+    setCaucionLoading(false);
+  };
+
   useEffect(()=>{
     const check=()=>setMktOpen(isMarketOpen());
-    check();
-    mktCheckRef.current=setInterval(check,30000);
+    check();mktCheckRef.current=setInterval(check,30000);
     return()=>clearInterval(mktCheckRef.current);
   },[]);
 
-  // Fetch on curve change, interval change, or source change
   useEffect(()=>{
     fetchQuotes();
     clearInterval(timerRef.current);
-    const ms=source==="byma"?Math.max(INTERVALS[intervalIdx].ms,30000):INTERVALS[intervalIdx].ms;
-    timerRef.current=setInterval(fetchQuotes,ms);
+    if(!isTasa&&!isByma){
+      const ms=INTERVALS[intervalIdx].ms;
+      timerRef.current=setInterval(fetchQuotes,ms);
+    }
     return()=>clearInterval(timerRef.current);
   },[activeCurve,intervalIdx,source]);
 
   const statusColor=status==="ok"?"#48bb78":status==="error"?"#fc8181":status==="loading"?"#f6e05e":"#a0aec0";
-
   const cellS={padding:"8px 12px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
   const btnS=(active)=>({padding:"6px 14px",borderRadius:4,border:active?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:active?"rgba(49,130,206,0.15)":"transparent",color:active?"#63b3ed":"#718096",fontSize:10,fontWeight:active?600:400,cursor:"pointer",fontFamily:"inherit"});
   const srcBtnS=(active,color)=>({padding:"6px 14px",borderRadius:4,border:active?`1px solid ${color}`:"1px solid rgba(99,179,237,0.15)",background:active?`${color}22`:"transparent",color:active?color:"#718096",fontSize:10,fontWeight:active?700:400,cursor:"pointer",fontFamily:"inherit"});
+  const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"\u2014";
+  const fmtRate=(v)=>v!=null?Number(v).toFixed(2)+"%":"\u2014";
 
   return(
-    <div>
+    <div style={{maxWidth:1100,margin:"0 auto"}}>
       {/* BYMA delay banner */}
-      {source==="byma"&&(
+      {isByma&&!isTasa&&(
         <div style={{marginBottom:16,padding:"10px 20px",background:"rgba(237,137,54,0.08)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:16}}>⏱️</span>
-          <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>BYMA Open — Datos con delay ~20 min <span style={{fontWeight:400,color:"#a0aec0"}}>(sin credenciales)</span></div>
+          <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>BYMA Open — Datos con delay ~20 min</div>
         </div>
       )}
 
-      {/* Market status banner */}
-      {!mktOpen&&source==="rofex"&&(
+      {/* Market status banner (ROFEX only) */}
+      {!mktOpen&&!isByma&&!isTasa&&(
         <div style={{marginBottom:16,padding:"12px 20px",background:"rgba(246,224,94,0.08)",border:"1px solid rgba(246,224,94,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:18}}>🔒</span>
           <div>
             <div style={{fontSize:13,fontWeight:600,color:"#f6e05e"}}>Mercado cerrado</div>
-            <div style={{fontSize:11,color:"#a0aec0"}}>Horario BYMA: 10:30 a 17:00 hs (Argentina) — Se muestran últimos valores disponibles</div>
+            <div style={{fontSize:11,color:"#a0aec0"}}>Horario BYMA: 10:30 a 17:00 hs (Argentina)</div>
           </div>
         </div>
       )}
 
-      {/* Source toggle + Sub-tabs for curves */}
+      {/* Source toggle + Curve tabs */}
       <div style={{display:"flex",gap:16,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
-        {/* Source selector */}
-        <div style={{display:"flex",gap:4,alignItems:"center",padding:"4px 6px",background:"rgba(99,179,237,0.04)",borderRadius:6,border:"1px solid rgba(99,179,237,0.08)"}}>
-          <span style={{fontSize:10,color:"#718096",marginRight:4}}>Fuente:</span>
-          <button onClick={()=>setSource("rofex")} style={srcBtnS(source==="rofex","#63b3ed")}>ROFEX</button>
-          <button onClick={()=>setSource("byma")} style={srcBtnS(source==="byma","#ed8936")}>BYMA Open</button>
-        </div>
-
-        {/* Curve tabs */}
+        {!isTasa&&(
+          <div style={{display:"flex",gap:4,alignItems:"center",padding:"4px 6px",background:"rgba(99,179,237,0.04)",borderRadius:6,border:"1px solid rgba(99,179,237,0.08)"}}>
+            <span style={{fontSize:10,color:"#718096",marginRight:4}}>Fuente:</span>
+            <button onClick={()=>setSource("rofex")} style={srcBtnS(source==="rofex","#63b3ed")}>ROFEX</button>
+            <button onClick={()=>setSource("byma")} style={srcBtnS(source==="byma","#ed8936")}>BYMA Open</button>
+          </div>
+        )}
         <div style={{display:"flex",gap:4}}>
           {curveKeys.map(k=>(
             <button key={k} onClick={()=>setActiveCurve(k)}
               style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
-              {curves[k].label}
+              {curveLabels[k]}
             </button>
           ))}
         </div>
       </div>
 
-      {/* Controls bar */}
-      <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-        {/* Status indicator */}
-        <div style={{display:"flex",alignItems:"center",gap:6}}>
-          <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
-          <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
-            {status==="ok"?(source==="byma"?"DELAYED":mktOpen?"LIVE":"OK"):status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
-          </span>
-        </div>
-
-        {/* Refresh interval selector */}
-        <div style={{display:"flex",alignItems:"center",gap:4}}>
-          <span style={{fontSize:10,color:"#718096",marginRight:4}}>Actualizar cada:</span>
-          {INTERVALS.map((iv,i)=>(
-            <button key={i} onClick={()=>setIntervalIdx(i)} style={btnS(i===intervalIdx)}>{iv.label}</button>
-          ))}
-        </div>
-
-        {/* Manual refresh */}
-        <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
-          ↻ Refresh
-        </button>
-
-        {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
-      </div>
-
-      {/* Error detail */}
-      {status==="error"&&errorMsg&&(
-        <div style={{marginBottom:16,padding:"10px 16px",background:"rgba(252,129,129,0.08)",border:"1px solid rgba(252,129,129,0.2)",borderRadius:8,fontSize:11,color:"#fc8181",wordBreak:"break-all"}}>
-          {errorMsg}
+      {/* Controls bar (only for ROFEX, not BYMA, not Tasa) */}
+      {!isByma&&!isTasa&&(
+        <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
+            <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
+              {status==="ok"?(mktOpen?"LIVE":"OK"):status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
+            </span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:4}}>
+            <span style={{fontSize:10,color:"#718096",marginRight:4}}>Actualizar cada:</span>
+            {INTERVALS.map((iv,i)=>(
+              <button key={i} onClick={()=>setIntervalIdx(i)} style={btnS(i===intervalIdx)}>{iv.label}</button>
+            ))}
+          </div>
+          <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
+          {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
         </div>
       )}
 
-      {/* Data table */}
-      <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
-        <table style={{width:"100%",borderCollapse:"collapse"}}>
-          <thead>
-            <tr>
-              <th style={hdS}>Símbolo</th>
-              <th style={{...hdS,textAlign:"right"}}>Last</th>
-              <th style={{...hdS,textAlign:"right"}}>Bid</th>
-              <th style={{...hdS,textAlign:"right"}}>Offer</th>
-              <th style={{...hdS,textAlign:"right"}}>Spread</th>
-              <th style={{...hdS,textAlign:"right"}}>Vol VN</th>
-              <th style={{...hdS,textAlign:"right"}}>{source==="byma"?"Monto":"Eff Vol"}</th>
-              <th style={{...hdS,textAlign:"center",width:40}}></th>
-            </tr>
-          </thead>
-          <tbody>
-            {curves[activeCurve].symbols.map(s=>{
-              const q=quotes[s.rofexTicker]||{};
-              const hasError=!!q.error;
-              const spread=(q.bid!=null&&q.offer!=null)?(q.offer-q.bid).toFixed(2):"\u2014";
-              const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"\u2014";
-              const lastCol=source==="byma"?(q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):"\u2014"):(q.effective_volume!=null?fmtNum(Math.round(q.effective_volume)):"\u2014");
-              return(
-                <tr key={s.display} style={{transition:"background 0.15s",opacity:hasError?0.5:1}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} title={hasError?q.error:(q.resolved_ticker||"")}>
-                  <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{s.display}</td>
-                  <td style={{...cellS,textAlign:"right",color:q.last!=null?"#f6e05e":"#4a5568"}}>{fmtPx(q.last)}</td>
-                  <td style={{...cellS,textAlign:"right",color:q.bid!=null?"#48bb78":"#4a5568"}}>{fmtPx(q.bid)}</td>
-                  <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fmtPx(q.offer)}</td>
-                  <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{spread}</td>
-                  <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"\u2014"}</td>
-                  <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{lastCol}</td>
-                  <td style={{...cellS,textAlign:"center"}}>{hasError?<span title={q.error} style={{color:"#fc8181",cursor:"help"}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78"}}>✓</span>:<span style={{color:"#4a5568"}}>—</span>}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      {/* BYMA/Tasa minimal controls */}
+      {(isByma||isTasa)&&(
+        <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
+            <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
+              {status==="ok"?"DELAYED":status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
+            </span>
+          </div>
+          <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
+          {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
+        </div>
+      )}
 
-      {/* Debug links */}
-      <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
-        Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/health</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{source==="byma"?"/api/byma/raw?symbol=AL30":"/api/debug/AL30"}</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{source==="byma"?"/api/byma/bonds?q=AL30":"/api/instruments?q=AL30"}</code>
-      </div>
+      {/* Error detail */}
+      {status==="error"&&errorMsg&&(
+        <div style={{marginBottom:16,padding:"10px 16px",background:"rgba(252,129,129,0.08)",border:"1px solid rgba(252,129,129,0.2)",borderRadius:8,fontSize:11,color:"#fc8181",wordBreak:"break-all"}}>{errorMsg}</div>
+      )}
+
+      {/* ── TASA TAB: Cauciones ── */}
+      {isTasa&&(
+        <div>
+          <div style={{marginBottom:12,padding:"10px 20px",background:"rgba(237,137,54,0.08)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:8}}>
+            <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>⏱️ Cauciones BYMA Open — Datos con delay ~20 min</div>
+          </div>
+          {cauciones&&(cauciones.ars?.length>0||cauciones.usd?.length>0)?(
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+              {/* ARS */}
+              <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+                <div style={{padding:"10px 16px",background:"#0d1220",fontWeight:700,fontSize:12,color:"#63b3ed"}}>Cauciones ARS $</div>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead><tr>
+                    <th style={hdS}>Días</th><th style={{...hdS,textAlign:"right"}}>Monto</th><th style={{...hdS,textAlign:"right"}}>VWAP</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={{...hdS,textAlign:"right"}}>Bid</th><th style={{...hdS,textAlign:"right"}}>Offer</th>
+                  </tr></thead>
+                  <tbody>
+                    {(cauciones.ars||[]).map((c,i)=>(
+                      <tr key={i} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <td style={{...cellS,fontWeight:700,color:"#f7fafc"}}>{c.days!=null?c.days+"d":"—"}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{c.monto!=null?fmtNum(Math.round(c.monto)):"—"}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#f6e05e",fontWeight:600}}>{fmtRate(c.rate_vwap)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_last!=null?"#f7fafc":"#4a5568"}}>{fmtRate(c.rate_last)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_bid!=null?"#48bb78":"#4a5568"}}>{fmtRate(c.rate_bid)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_offer!=null?"#fc8181":"#4a5568"}}>{fmtRate(c.rate_offer)}</td>
+                      </tr>
+                    ))}
+                    {(cauciones.ars||[]).length===0&&<tr><td colSpan={6} style={{...cellS,textAlign:"center",color:"#4a5568"}}>Sin datos ARS</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+              {/* USD */}
+              <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(72,187,120,0.15)",overflow:"hidden"}}>
+                <div style={{padding:"10px 16px",background:"#0d1220",fontWeight:700,fontSize:12,color:"#68d391"}}>Cauciones USD U$S</div>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead><tr>
+                    <th style={hdS}>Días</th><th style={{...hdS,textAlign:"right"}}>Monto</th><th style={{...hdS,textAlign:"right"}}>VWAP</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={{...hdS,textAlign:"right"}}>Bid</th><th style={{...hdS,textAlign:"right"}}>Offer</th>
+                  </tr></thead>
+                  <tbody>
+                    {(cauciones.usd||[]).map((c,i)=>(
+                      <tr key={i} onMouseEnter={e=>e.currentTarget.style.background="rgba(72,187,120,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <td style={{...cellS,fontWeight:700,color:"#f7fafc"}}>{c.days!=null?c.days+"d":"—"}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{c.monto!=null?fmtNum(Math.round(c.monto)):"—"}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#f6e05e",fontWeight:600}}>{fmtRate(c.rate_vwap)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_last!=null?"#f7fafc":"#4a5568"}}>{fmtRate(c.rate_last)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_bid!=null?"#48bb78":"#4a5568"}}>{fmtRate(c.rate_bid)}</td>
+                        <td style={{...cellS,textAlign:"right",color:c.rate_offer!=null?"#fc8181":"#4a5568"}}>{fmtRate(c.rate_offer)}</td>
+                      </tr>
+                    ))}
+                    {(cauciones.usd||[]).length===0&&<tr><td colSpan={6} style={{...cellS,textAlign:"center",color:"#4a5568"}}>Sin datos USD</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ):(
+            caucionLoading?
+              <div style={{padding:40,textAlign:"center",color:"#a0aec0",fontSize:13}}>Cargando cauciones...</div>:
+              <div style={{padding:40,textAlign:"center",color:"#4a5568",fontSize:13}}>No hay datos de cauciones disponibles. <button onClick={fetchCauciones} style={{color:"#63b3ed",background:"none",border:"none",cursor:"pointer",fontFamily:"inherit",textDecoration:"underline"}}>Reintentar</button></div>
+          )}
+          <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
+            Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/byma/cauciones</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/byma/cauciones/raw</code>
+          </div>
+        </div>
+      )}
+
+      {/* ── BONDS TABLE ── */}
+      {!isTasa&&(
+        <div>
+          <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead>
+                <tr>
+                  <th style={hdS}>Símbolo</th>
+                  <th style={{...hdS,textAlign:"right"}}>Last</th>
+                  <th style={{...hdS,textAlign:"right"}}>Bid</th>
+                  <th style={{...hdS,textAlign:"right"}}>Offer</th>
+                  <th style={{...hdS,textAlign:"right"}}>Spread</th>
+                  <th style={{...hdS,textAlign:"right"}}>Vol VN</th>
+                  <th style={{...hdS,textAlign:"right"}}>Monto</th>
+                  <th style={{...hdS,textAlign:"right"}}>VWAP</th>
+                  <th style={{...hdS,textAlign:"center",width:40}}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {curves[activeCurve].symbols.map(s=>{
+                  const q=quotes[s.rofexTicker]||{};
+                  const hasError=!!q.error;
+                  const spread=(q.bid!=null&&q.offer!=null)?(q.offer-q.bid).toFixed(2):"\u2014";
+                  return(
+                    <tr key={s.display} style={{transition:"background 0.15s",opacity:hasError?0.5:1}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} title={hasError?q.error:(q.resolved_ticker||"")}>
+                      <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{s.display}</td>
+                      <td style={{...cellS,textAlign:"right",color:q.last!=null?"#f6e05e":"#4a5568"}}>{fmtPx(q.last)}</td>
+                      <td style={{...cellS,textAlign:"right",color:q.bid!=null?"#48bb78":"#4a5568"}}>{fmtPx(q.bid)}</td>
+                      <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fmtPx(q.offer)}</td>
+                      <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{spread}</td>
+                      <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"\u2014"}</td>
+                      <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):(q.effective_volume!=null?fmtNum(Math.round(q.effective_volume)):"\u2014")}</td>
+                      {isByma&&<td style={{...cellS,textAlign:"right",color:q.vwap!=null?"#b794f4":"#4a5568",fontWeight:q.vwap!=null?600:400}}>{fmtPx(q.vwap)}</td>}
+                      {!isByma&&<td style={{...cellS,textAlign:"right",color:"#4a5568"}}>—</td>}
+                      <td style={{...cellS,textAlign:"center"}}>{hasError?<span title={q.error} style={{color:"#fc8181",cursor:"help"}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78"}}>✓</span>:<span style={{color:"#4a5568"}}>—</span>}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
+            Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/health</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{isByma?"/api/byma/raw?symbol=AL30":"/api/debug/AL30"}</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{isByma?"/api/byma/bonds?q=AL30":"/api/instruments?q=AL30"}</code>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

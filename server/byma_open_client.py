@@ -104,6 +104,7 @@ _FIELD_MAP = {
     "offer": ["offer", "puntaVenta", "bestAsk", "ask", "Ask", "Offer", "OFFER", "precioVenta"],
     "vol_amount": ["monto", "volumenMonto", "amount", "MontoOperado", "montoOperado", "tradeAmount"],
     "vol_vn": ["volume", "volumen", "nominal", "vn", "volumenNominal", "Volume", "VOLUME", "cantidadOperada"],
+    "vwap": ["vwap", "VWAP", "precioPromedioPonderado", "avgPrice", "precioProm"],
     "description": ["description", "descripcion", "name", "denominacion", "Descripcion"],
     "settlement": ["settlement", "plazo", "vencimiento", "settl"],
 }
@@ -162,6 +163,7 @@ def quotes_for(symbols: list[str]) -> dict:
                 "offer": _safe_float(_extract_field(row, "offer")),
                 "vol_amount": _safe_float(_extract_field(row, "vol_amount")),
                 "vol_vn": _safe_float(_extract_field(row, "vol_vn")),
+                "vwap": _safe_float(_extract_field(row, "vwap")),
                 "source": "open-bymadata",
             }
         else:
@@ -239,9 +241,149 @@ def health() -> dict:
 def _empty_quote(error=None):
     q = {
         "last": None, "bid": None, "offer": None,
-        "vol_amount": None, "vol_vn": None,
+        "vol_amount": None, "vol_vn": None, "vwap": None,
         "source": "open-bymadata",
     }
     if error:
         q["error"] = error
     return q
+
+
+# ── Cauciones (direct HTTP, not in PyOBD) ───────────────────
+
+_CAUCION_URLS = [
+    "https://open.bymadata.com.ar/vanep/Api/v1/Cauciones",
+    "https://open.bymadata.com.ar/vanep/Api/v1/cauciones",
+]
+_caucion_sample_keys = None
+
+
+def get_cauciones() -> list:
+    """Fetch cauciones from Open BYMA Data (direct HTTP).
+    Returns list of dicts with parsed fields. Cached with TTL."""
+    global _caucion_sample_keys
+
+    cached = _cache_get("cauciones_raw")
+    if cached is not None:
+        return cached
+
+    import requests
+
+    rows = []
+    last_error = None
+    for url in _CAUCION_URLS:
+        try:
+            r = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FinOps/1.0)",
+                "Accept": "application/json",
+            })
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict) and "data" in data:
+                    rows = data["data"] if isinstance(data["data"], list) else []
+                elif isinstance(data, dict) and "Content" in data:
+                    rows = data["Content"] if isinstance(data["Content"], list) else []
+                else:
+                    rows = [data] if data else []
+
+                if rows and _caucion_sample_keys is None:
+                    _caucion_sample_keys = list(rows[0].keys())
+                    print(f"  Cauciones sample keys: {_caucion_sample_keys}")
+                    print(f"  Cauciones sample row: {rows[0]}")
+                    print(f"  Cauciones total rows: {len(rows)}")
+
+                _cache_set("cauciones_raw", rows)
+                return rows
+            else:
+                last_error = f"HTTP {r.status_code} from {url}"
+        except Exception as e:
+            last_error = f"{url}: {e}"
+
+    print(f"✗ Cauciones fetch failed: {last_error}")
+    _cache_set("cauciones_raw", [])  # cache empty to avoid hammering
+    return []
+
+
+def get_cauciones_parsed(max_days: int = 7) -> dict:
+    """Return cauciones parsed by currency (ARS/USD) and days.
+    Returns { "ars": [...], "usd": [...], "raw_sample_keys": [...] }
+    """
+    rows = get_cauciones()
+    if not rows:
+        return {"ars": [], "usd": [], "raw_sample_keys": _caucion_sample_keys, "error": "No data"}
+
+    # Defensive field candidates for cauciones
+    _C_FIELDS = {
+        "days": ["days", "dias", "plazo", "Plazo", "diasVenc", "DaysToMaturity", "cantDias", "plazoStr"],
+        "currency": ["currency", "moneda", "Moneda", "currencyId", "denominationCcy"],
+        "rate_vwap": ["vwap", "tasaVWAP", "tnaVWAP", "rateVwap", "tasaProm", "VWAP", "precioPromPonderado"],
+        "rate_last": ["last", "ultimo", "tasa", "Last", "rate", "tasaUltima"],
+        "rate_bid": ["bid", "puntaCompra", "bestBid", "Bid", "tasaCompra"],
+        "rate_offer": ["offer", "puntaVenta", "bestAsk", "ask", "tasaVenta", "Offer"],
+        "monto": ["monto", "amount", "montoOperado", "MontoOperado", "tradeAmount", "vol_amount"],
+        "symbol": ["symbol", "simbolo", "ticker", "Symbol", "description", "descripcion"],
+    }
+
+    def _get(row, field):
+        for key in _C_FIELDS.get(field, [field]):
+            if key in row:
+                val = row[key]
+                if val is not None and val != "":
+                    return val
+        return None
+
+    ars_list = []
+    usd_list = []
+
+    for row in rows:
+        days_raw = _get(row, "days")
+        days = None
+        if days_raw is not None:
+            try:
+                days = int(float(str(days_raw)))
+            except:
+                pass
+
+        if days is not None and days > max_days:
+            continue
+
+        currency = str(_get(row, "currency") or "").upper()
+        is_usd = "USD" in currency or "D" in currency or "U$S" in currency or "DOLAR" in currency
+
+        parsed = {
+            "days": days,
+            "currency_raw": _get(row, "currency"),
+            "rate_vwap": _safe_float(_get(row, "rate_vwap")),
+            "rate_last": _safe_float(_get(row, "rate_last")),
+            "rate_bid": _safe_float(_get(row, "rate_bid")),
+            "rate_offer": _safe_float(_get(row, "rate_offer")),
+            "monto": _safe_float(_get(row, "monto")),
+            "symbol": _get(row, "symbol"),
+        }
+
+        if is_usd:
+            usd_list.append(parsed)
+        else:
+            ars_list.append(parsed)
+
+    ars_list.sort(key=lambda x: x["days"] or 999)
+    usd_list.sort(key=lambda x: x["days"] or 999)
+
+    return {
+        "ars": ars_list,
+        "usd": usd_list,
+        "raw_sample_keys": _caucion_sample_keys,
+    }
+
+
+def raw_caucion() -> dict:
+    """Return raw cauciones data for debugging."""
+    rows = get_cauciones()
+    return {
+        "total_rows": len(rows),
+        "sample_keys": _caucion_sample_keys,
+        "first_5": rows[:5] if rows else [],
+    }
+
