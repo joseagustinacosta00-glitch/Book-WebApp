@@ -82,10 +82,43 @@ const INIT_INST = {
   Bopreales:[{ticker:"BPJ25",currency:"MEP"},{ticker:"BPY26",currency:"MEP"},{ticker:"BPD27",currency:"MEP"},{ticker:"BPOA7",currency:"MEP"},{ticker:"BPOB7",currency:"MEP"},{ticker:"BPOC7",currency:"MEP"}],
   Acciones:[{ticker:"GGAL",currency:"ARS"},{ticker:"YPF",currency:"ARS"},{ticker:"PAMP",currency:"ARS"},{ticker:"BBAR",currency:"ARS"},{ticker:"BMA",currency:"ARS"},{ticker:"TXAR",currency:"ARS"},{ticker:"ALUA",currency:"ARS"},{ticker:"CRES",currency:"ARS"},{ticker:"TECO2",currency:"ARS"},{ticker:"EDN",currency:"ARS"},{ticker:"SUPV",currency:"ARS"},{ticker:"MIRG",currency:"ARS"},{ticker:"COME",currency:"ARS"},{ticker:"TRAN",currency:"ARS"},{ticker:"CEPU",currency:"ARS"},{ticker:"LOMA",currency:"ARS"}],
   Provinciales:[{ticker:"PBA25",currency:"ARS"},{ticker:"CABA2028",currency:"ARS"},{ticker:"CO26",currency:"ARS"},{ticker:"CO26D",currency:"MEP"},{ticker:"CUAP",currency:"ARS"},{ticker:"SF27",currency:"ARS"},{ticker:"SF27D",currency:"MEP"}],
+  Monedas:[{ticker:"MEP",currency:"USD"},{ticker:"CCL",currency:"USD"},{ticker:"CANJE",currency:"USD"}],
 };
 
 function loadS(k,f){try{const r=localStorage.getItem(k);return r?JSON.parse(r):f;}catch{return f;}}
 function saveS(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){console.warn(e);}}
+
+// ============================================================
+// CSV / Excel export helpers
+// ============================================================
+function downloadCSV(ops,dateLabel){
+  const header="Ticker;Tipo;Plazo;Moneda;VN;PX;Monto\n";
+  const rows=ops.map(o=>[o.ticker,o.type,"T+"+o.plazo,o.currency||"",o.vn,Number(o.px).toFixed(2).replace(".",","),Number(o.monto).toFixed(2).replace(".",",")].join(";")).join("\n");
+  const bom="\uFEFF";// UTF-8 BOM for Excel
+  const blob=new Blob([bom+header+rows],{type:"text/csv;charset=utf-8;"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`operaciones_${dateLabel}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function downloadAuditCSV(ops,fromDate,toDate){
+  const header="Fecha Concertación;Fecha Liquidación;Ticker;Tipo;Moneda;VN;PX;Monto\n";
+  const sorted=[...ops].sort((a,b)=>a.date.localeCompare(b.date));
+  const rows=sorted.map(o=>{
+    const fConc=fmtDD(o.date);
+    const fLiq=o.plazo==="0"?fmtDD(o.date):fmtDD(getNextBusinessDay(o.date));
+    return[fConc,fLiq,o.ticker,o.type,o.currency||"",o.vn,Number(o.px).toFixed(2).replace(".",","),Number(o.monto).toFixed(2).replace(".",",")].join(";");
+  }).join("\n");
+  const bom="\uFEFF";
+  const blob=new Blob([bom+header+rows],{type:"text/csv;charset=utf-8;"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=`auditoria_${fromDate}_${toDate}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 // ============================================================
 // APP
@@ -94,13 +127,16 @@ export default function App(){
   const[tab,setTab]=useState("dashboard");
   const[instruments,setInstruments]=useState(()=>loadS("i1",INIT_INST));
   const[operations,setOperations]=useState(()=>loadS("o1",[]));
+  const[fxOps,setFxOps]=useState(()=>loadS("fx1",[]));
   useEffect(()=>{saveS("i1",instruments);},[instruments]);
   useEffect(()=>{saveS("o1",operations);},[operations]);
+  useEffect(()=>{saveS("fx1",fxOps);},[fxOps]);
   const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>its.forEach(i=>l.push({...i,family:f})));return l;},[instruments]);
 
   const tabs=[
     {id:"dashboard",label:"Dashboard",icon:"\u{1F4CA}"},
-    {id:"registro",label:"Registro de Operaciones",icon:"\u{1F4CB}"},
+    {id:"blotter",label:"Blotter",icon:"\u{1F4CB}"},
+    {id:"auditoria",label:"Auditoría",icon:"\u{1F50D}"},
     {id:"instrumentos",label:"Base de Instrumentos",icon:"\u{1F5C4}\uFE0F"},
     {id:"posicion",label:"Posición & PNL",icon:"\u{1F4B0}"},
     {id:"mercado",label:"Mercado",icon:"\u{1F4E1}"},
@@ -123,8 +159,9 @@ export default function App(){
         ))}
       </nav>
       <main style={{padding:"24px 32px",maxWidth:1500,margin:"0 auto"}}>
-        {tab==="dashboard"&&<Dashboard operations={operations}/>}
-        {tab==="registro"&&<RegistroOps operations={operations} setOperations={setOperations} allTickers={allTickers}/>}
+        {tab==="dashboard"&&<Dashboard operations={operations} fxOps={fxOps}/>}
+        {tab==="blotter"&&<Blotter operations={operations} setOperations={setOperations} fxOps={fxOps} setFxOps={setFxOps} allTickers={allTickers}/>}
+        {tab==="auditoria"&&<Auditoria operations={operations} fxOps={fxOps}/>}
         {tab==="instrumentos"&&<BaseInstrumentos instruments={instruments} setInstruments={setInstruments}/>}
         {tab==="posicion"&&<Placeholder name="Posición & PNL"/>}
         {tab==="mercado"&&<Mercado/>}
@@ -234,7 +271,223 @@ function Badge({color,text}){
 }
 
 // ============================================================
-// REGISTRO OPERACIONES
+// BLOTTER — Wrapper with Títulos / FX sub-tabs
+// ============================================================
+function Blotter({operations,setOperations,fxOps,setFxOps,allTickers}){
+  const[subTab,setSubTab]=useState("titulos");
+  const btnStyle=(active)=>({padding:"8px 20px",borderRadius:6,border:active?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:active?"rgba(49,130,206,0.15)":"transparent",color:active?"#63b3ed":"#a0aec0",fontWeight:active?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"});
+  return(
+    <div>
+      <div style={{display:"flex",gap:6,marginBottom:20}}>
+        <button onClick={()=>setSubTab("titulos")} style={btnStyle(subTab==="titulos")}>Títulos</button>
+        <button onClick={()=>setSubTab("fx")} style={btnStyle(subTab==="fx")}>FX (MEP / Cable / Canje)</button>
+      </div>
+      {subTab==="titulos"&&<RegistroOps operations={operations} setOperations={setOperations} allTickers={allTickers}/>}
+      {subTab==="fx"&&<RegistroFX fxOps={fxOps} setFxOps={setFxOps}/>}
+    </div>
+  );
+}
+
+// ============================================================
+// REGISTRO FX — MEP, Cable (CCL), Canje
+// ============================================================
+function RegistroFX({fxOps,setFxOps}){
+  const today=fmtD(new Date());
+  const[selDate,setSelDate]=useState(()=>isBusinessDay(today)?today:getNextBusinessDay(today));
+  const[fxType,setFxType]=useState("MEP");// MEP | CCL | CANJE
+  const[tipo,setTipo]=useState("COMPRA");
+  const[plazo,setPlazo]=useState("0");
+  const[vnRaw,setVnRaw]=useState("");
+  const[pxRaw,setPxRaw]=useState("");
+
+  const isToday=selDate===today;
+  const filtered=useMemo(()=>fxOps.filter(o=>o.date===selDate),[fxOps,selDate]);
+
+  const pxNum=useMemo(()=>{
+    if(!pxRaw)return 0;
+    const clean=pxRaw.replace(/\./g,"").replace(",",".");
+    return parseFloat(clean)||0;
+  },[pxRaw]);
+
+  const vnNum=vnRaw?parseInt(vnRaw,10):0;
+
+  // Calculate montos
+  const montos=useMemo(()=>{
+    if(!vnRaw||!pxRaw||vnNum<=0||pxNum<=0)return null;
+    if(fxType==="MEP"){
+      // VN=USD, PX=tipo cambio, Monto ARS = VN*PX
+      const ars=vnNum*pxNum;
+      return tipo==="COMPRA"
+        ?{usd_mep:vnNum,ars:-ars}
+        :{usd_mep:-vnNum,ars:ars};
+    }
+    if(fxType==="CCL"){
+      const ars=vnNum*pxNum;
+      return tipo==="COMPRA"
+        ?{usd_cable:vnNum,ars:-ars}
+        :{usd_cable:-vnNum,ars:ars};
+    }
+    if(fxType==="CANJE"){
+      // VN=cables, PX=%, Compra: +cables -MEP(VN*(1+PX/100))
+      const mepAmount=vnNum*(1+pxNum/100);
+      return tipo==="COMPRA"
+        ?{usd_cable:vnNum,usd_mep:-mepAmount}
+        :{usd_cable:-vnNum,usd_mep:mepAmount};
+    }
+    return null;
+  },[vnRaw,pxRaw,vnNum,pxNum,fxType,tipo]);
+
+  const handleVnChange=(e)=>setVnRaw(e.target.value.replace(/[^0-9]/g,""));
+  const handlePxChange=(e)=>{
+    let v=e.target.value.replace(/[^0-9,]/g,"");
+    const parts=v.split(",");
+    if(parts.length>2)v=parts[0]+","+parts.slice(1).join("");
+    if(parts.length===2&&parts[1].length>2)v=parts[0]+","+parts[1].slice(0,2);
+    const intPart=parts[0].replace(/^0+(?=\d)/,"");
+    const formatted=intPart.replace(/\B(?=(\d{3})+(?!\d))/g,".");
+    setPxRaw(parts.length===2?formatted+","+parts[1]:formatted);
+  };
+
+  const trySubmit=()=>{
+    if(!vnRaw||!pxRaw||vnNum<=0||pxNum<=0||!montos)return;
+    const op={id:Date.now().toString(),date:selDate,fxType,tipo,plazo,vn:vnNum,px:pxNum,...montos};
+    if(!isToday){
+      if(!window.confirm(`Registrar FX en ${fmtDD(selDate)}?`))return;
+    }
+    setFxOps(p=>[...p,op]);
+    setVnRaw("");setPxRaw("");
+  };
+
+  const removeOp=(id)=>{
+    if(!isToday&&!window.confirm("Eliminar operación FX de otra fecha?"))return;
+    setFxOps(p=>p.filter(o=>o.id!==id));
+  };
+
+  const vnDisplay=vnRaw?fmtNum(parseInt(vnRaw,10)):"";
+  const iS={padding:"8px 10px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none",boxSizing:"border-box"};
+
+  return(
+    <div>
+      {/* Date row */}
+      <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:20,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <label style={{fontSize:12,color:"#a0aec0",textTransform:"uppercase",letterSpacing:"1px"}}>Fecha</label>
+          <div style={{borderRadius:10,border:isToday?"2px solid #48bb78":"2px solid #fc8181",padding:1}}>
+            <DatePicker value={selDate} onChange={setSelDate}/>
+          </div>
+        </div>
+      </div>
+
+      {/* FX Type selector */}
+      <div style={{display:"flex",gap:6,marginBottom:16}}>
+        {["MEP","CCL","CANJE"].map(t=>(
+          <button key={t} onClick={()=>setFxType(t)} style={{padding:"8px 20px",borderRadius:6,border:fxType===t?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:fxType===t?"rgba(49,130,206,0.15)":"transparent",color:fxType===t?"#63b3ed":"#a0aec0",fontWeight:fxType===t?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>{t==="CCL"?"Cable":t}</button>
+        ))}
+      </div>
+
+      {/* Operations table */}
+      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)"}}>
+        <div style={{padding:"16px 20px",borderBottom:"1px solid rgba(99,179,237,0.1)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:14,fontWeight:600}}>FX — {fxType==="CCL"?"Cable":fxType} — {fmtDD(selDate)}</div>
+          <div style={{fontSize:12,color:"#718096"}}>{filtered.filter(o=>o.fxType===fxType).length} registros</div>
+        </div>
+
+        {/* Header */}
+        {fxType!=="CANJE"?(
+          <div style={{display:"grid",gridTemplateColumns:"100px 80px 120px 140px 180px 50px",padding:"10px 20px",background:"#0d1220",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"1.2px",color:"#718096"}}>
+            <div>Tipo</div><div>Plazo</div><div style={{textAlign:"right"}}>VN (USD)</div><div style={{textAlign:"right"}}>PX (TC)</div><div style={{textAlign:"right"}}>Monto ARS</div><div></div>
+          </div>
+        ):(
+          <div style={{display:"grid",gridTemplateColumns:"100px 80px 120px 120px 160px 160px 50px",padding:"10px 20px",background:"#0d1220",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"1.2px",color:"#718096"}}>
+            <div>Tipo</div><div>Plazo</div><div style={{textAlign:"right"}}>VN (Cable)</div><div style={{textAlign:"right"}}>PX (%)</div><div style={{textAlign:"right"}}>Cable</div><div style={{textAlign:"right"}}>MEP</div><div></div>
+          </div>
+        )}
+
+        {/* Existing ops */}
+        {filtered.filter(o=>o.fxType===fxType).map(op=>{
+          const isC=op.tipo==="COMPRA";
+          if(fxType!=="CANJE"){
+            const arsVal=op.ars||0;
+            const usdVal=fxType==="MEP"?(op.usd_mep||0):(op.usd_cable||0);
+            return(
+              <div key={op.id} style={{display:"grid",gridTemplateColumns:"100px 80px 120px 140px 180px 50px",padding:"12px 20px",borderBottom:"1px solid rgba(99,179,237,0.05)",alignItems:"center",fontSize:13}}>
+                <div><span style={{padding:"3px 10px",borderRadius:4,fontSize:11,fontWeight:600,background:isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)",color:isC?"#68d391":"#fc8181"}}>{op.tipo}</span></div>
+                <div style={{color:"#a0aec0"}}>T+{op.plazo}</div>
+                <div style={{textAlign:"right"}}>{fmtNum(Math.abs(usdVal))}</div>
+                <div style={{textAlign:"right"}}>{Number(op.px).toFixed(2)}</div>
+                <div style={{textAlign:"right",fontWeight:600,color:arsVal>=0?"#68d391":"#fc8181"}}>{fmtMoney(arsVal)}</div>
+                <div style={{textAlign:"center"}}><button onClick={()=>removeOp(op.id)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:14,padding:4}}>{"\u2715"}</button></div>
+              </div>
+            );
+          }else{
+            return(
+              <div key={op.id} style={{display:"grid",gridTemplateColumns:"100px 80px 120px 120px 160px 160px 50px",padding:"12px 20px",borderBottom:"1px solid rgba(99,179,237,0.05)",alignItems:"center",fontSize:13}}>
+                <div><span style={{padding:"3px 10px",borderRadius:4,fontSize:11,fontWeight:600,background:isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)",color:isC?"#68d391":"#fc8181"}}>{op.tipo}</span></div>
+                <div style={{color:"#a0aec0"}}>T+{op.plazo}</div>
+                <div style={{textAlign:"right"}}>{fmtNum(op.vn)}</div>
+                <div style={{textAlign:"right"}}>{Number(op.px).toFixed(2)}%</div>
+                <div style={{textAlign:"right",fontWeight:600,color:(op.usd_cable||0)>=0?"#68d391":"#fc8181"}}>{fmtNum(Math.round(op.usd_cable||0))} USD</div>
+                <div style={{textAlign:"right",fontWeight:600,color:(op.usd_mep||0)>=0?"#68d391":"#fc8181"}}>{fmtNum(Math.round(op.usd_mep||0))} USD</div>
+                <div style={{textAlign:"center"}}><button onClick={()=>removeOp(op.id)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:14,padding:4}}>{"\u2715"}</button></div>
+              </div>
+            );
+          }
+        })}
+
+        {/* New op input row */}
+        {fxType!=="CANJE"?(
+          <div style={{display:"grid",gridTemplateColumns:"100px 80px 120px 140px 180px 50px",gap:8,padding:"12px 20px",borderTop:"1px solid rgba(99,179,237,0.1)",background:"rgba(99,179,237,0.02)",alignItems:"center"}}>
+            <div style={{display:"flex",gap:2}}>
+              {["COMPRA","VENTA"].map(t=>{const isC=t==="COMPRA",act=tipo===t;return(
+                <button key={t} onClick={()=>setTipo(t)} style={{flex:1,padding:"8px 4px",borderRadius:isC?"6px 0 0 6px":"0 6px 6px 0",border:"1px solid",borderColor:act?(isC?"rgba(72,187,120,0.4)":"rgba(245,101,101,0.4)"):"rgba(99,179,237,0.15)",background:act?(isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)"):"#1a2332",color:act?(isC?"#68d391":"#fc8181"):"#718096",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>{isC?"C":"V"}</button>
+              );})}
+            </div>
+            <div style={{display:"flex",gap:2}}>
+              {["0","1"].map(p=>(
+                <button key={p} onClick={()=>setPlazo(p)} style={{flex:1,padding:"8px 4px",borderRadius:p==="0"?"6px 0 0 6px":"0 6px 6px 0",border:"1px solid",borderColor:plazo===p?"rgba(99,179,237,0.4)":"rgba(99,179,237,0.15)",background:plazo===p?"rgba(99,179,237,0.15)":"#1a2332",color:plazo===p?"#63b3ed":"#718096",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>T+{p}</button>
+              ))}
+            </div>
+            <input type="text" inputMode="numeric" placeholder="USD" value={vnDisplay} onChange={handleVnChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()} style={{...iS,textAlign:"right"}} autoComplete="off"/>
+            <input type="text" inputMode="decimal" placeholder="TC" value={pxRaw} onChange={handlePxChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()} style={{...iS,textAlign:"right"}} autoComplete="off"/>
+            <div style={{textAlign:"right",fontSize:13,fontWeight:600,color:montos?.ars==null?"#4a5568":montos.ars>=0?"#68d391":"#fc8181"}}>
+              {montos?.ars!=null?fmtMoney(montos.ars):"\u2014"}
+            </div>
+            <div style={{textAlign:"center"}}>
+              <button onClick={trySubmit} disabled={!montos} style={{background:montos?"linear-gradient(135deg,#3182ce,#63b3ed)":"#2d3748",border:"none",borderRadius:6,color:montos?"#fff":"#4a5568",cursor:montos?"pointer":"not-allowed",padding:"7px 10px",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>+</button>
+            </div>
+          </div>
+        ):(
+          <div style={{display:"grid",gridTemplateColumns:"100px 80px 120px 120px 160px 160px 50px",gap:8,padding:"12px 20px",borderTop:"1px solid rgba(99,179,237,0.1)",background:"rgba(99,179,237,0.02)",alignItems:"center"}}>
+            <div style={{display:"flex",gap:2}}>
+              {["COMPRA","VENTA"].map(t=>{const isC=t==="COMPRA",act=tipo===t;return(
+                <button key={t} onClick={()=>setTipo(t)} style={{flex:1,padding:"8px 4px",borderRadius:isC?"6px 0 0 6px":"0 6px 6px 0",border:"1px solid",borderColor:act?(isC?"rgba(72,187,120,0.4)":"rgba(245,101,101,0.4)"):"rgba(99,179,237,0.15)",background:act?(isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)"):"#1a2332",color:act?(isC?"#68d391":"#fc8181"):"#718096",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>{isC?"C":"V"}</button>
+              );})}
+            </div>
+            <div style={{display:"flex",gap:2}}>
+              {["0","1"].map(p=>(
+                <button key={p} onClick={()=>setPlazo(p)} style={{flex:1,padding:"8px 4px",borderRadius:p==="0"?"6px 0 0 6px":"0 6px 6px 0",border:"1px solid",borderColor:plazo===p?"rgba(99,179,237,0.4)":"rgba(99,179,237,0.15)",background:plazo===p?"rgba(99,179,237,0.15)":"#1a2332",color:plazo===p?"#63b3ed":"#718096",fontSize:10,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>T+{p}</button>
+              ))}
+            </div>
+            <input type="text" inputMode="numeric" placeholder="VN Cable" value={vnDisplay} onChange={handleVnChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()} style={{...iS,textAlign:"right"}} autoComplete="off"/>
+            <input type="text" inputMode="decimal" placeholder="%" value={pxRaw} onChange={handlePxChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()} style={{...iS,textAlign:"right"}} autoComplete="off"/>
+            <div style={{textAlign:"right",fontSize:12,fontWeight:600,color:montos?.usd_cable==null?"#4a5568":(montos.usd_cable>=0?"#68d391":"#fc8181")}}>
+              {montos?.usd_cable!=null?fmtNum(Math.round(montos.usd_cable))+" USD":"\u2014"}
+            </div>
+            <div style={{textAlign:"right",fontSize:12,fontWeight:600,color:montos?.usd_mep==null?"#4a5568":(montos.usd_mep>=0?"#68d391":"#fc8181")}}>
+              {montos?.usd_mep!=null?fmtNum(Math.round(montos.usd_mep))+" USD":"\u2014"}
+            </div>
+            <div style={{textAlign:"center"}}>
+              <button onClick={trySubmit} disabled={!montos} style={{background:montos?"linear-gradient(135deg,#3182ce,#63b3ed)":"#2d3748",border:"none",borderRadius:6,color:montos?"#fff":"#4a5568",cursor:montos?"pointer":"not-allowed",padding:"7px 10px",fontSize:14,fontWeight:700,fontFamily:"inherit"}}>+</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// REGISTRO OPERACIONES (Títulos)
 // ============================================================
 function RegistroOps({operations,setOperations,allTickers}){
   const today=fmtD(new Date());
@@ -302,7 +555,6 @@ function RegistroOps({operations,setOperations,allTickers}){
             animation:"slowPulse 4s ease-in-out infinite",
             cursor:"pointer",
           }} title="Click para ocultar esta alerta" onClick={()=>setShowAlert(false)}>
-            <span style={{fontSize:14}}>⏰</span>
             <span style={{fontSize:12,fontWeight:600,color:"#fc8181"}}>{daysDiffLabel}</span>
           </div>
         )}
@@ -351,7 +603,14 @@ function RegistroOps({operations,setOperations,allTickers}){
       <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",position:"relative"}}>
         <div style={{padding:"16px 20px",borderBottom:"1px solid rgba(99,179,237,0.1)",display:"flex",justifyContent:"space-between",alignItems:"center",borderRadius:"12px 12px 0 0"}}>
           <div style={{fontSize:14,fontWeight:600}}>Operaciones — {fmtDD(selDate)}</div>
-          <div style={{fontSize:12,color:"#718096"}}>{filtered.length} registro{filtered.length!==1?"s":""}</div>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            {filtered.length>0&&(
+              <button onClick={()=>downloadCSV(filtered,selDate)} title="Descargar operaciones del día" style={{background:"none",border:"1px solid rgba(99,179,237,0.2)",borderRadius:6,color:"#63b3ed",cursor:"pointer",padding:"4px 10px",fontSize:12,fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+                ⬇ Excel
+              </button>
+            )}
+            <div style={{fontSize:12,color:"#718096"}}>{filtered.length} registro{filtered.length!==1?"s":""}</div>
+          </div>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"200px 100px 80px 130px 130px 170px 50px",padding:"10px 20px",background:"#0d1220",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"1.2px",color:"#718096"}}>
           <div>Ticker</div><div>Tipo</div><div>Plazo</div><div style={{textAlign:"right"}}>VN</div><div style={{textAlign:"right"}}>PX (base 100)</div><div style={{textAlign:"right"}}>Monto</div><div></div>
@@ -457,7 +716,7 @@ function NewOpRow({allTickers,onAdd}){
   const[type,setType]=useState("COMPRA");
   const[plazo,setPlazo]=useState("0");
   const[vnRaw,setVnRaw]=useState(""); // raw digits string
-  const[px,setPx]=useState("");
+  const[pxRaw,setPxRaw]=useState(""); // raw digits string for integer part + decimals
   const[showSug,setShowSug]=useState(false);
   const[sugIdx,setSugIdx]=useState(0);
   const tickerRef=useRef(null);
@@ -475,15 +734,37 @@ function NewOpRow({allTickers,onAdd}){
     return[...starts,...contains].slice(0,5);
   },[ticker,allTickers]);
 
-  const vnNum=vnRaw?parseInt(vnRaw,10):0;
-  const pxNum=px?parseFloat(px):0;
+  // Parse PX: user types digits and optionally a comma for decimals
+  // Display with dots for thousands: 1.234,56
+  const pxNum=useMemo(()=>{
+    if(!pxRaw)return 0;
+    const clean=pxRaw.replace(/\./g,"").replace(",",".");
+    return parseFloat(clean)||0;
+  },[pxRaw]);
+
+  const handlePxChange=(e)=>{
+    // Allow digits, one comma for decimals, dots for thousands (we format them)
+    let v=e.target.value;
+    // Strip everything except digits and comma
+    v=v.replace(/[^0-9,]/g,"");
+    // Only one comma allowed
+    const parts=v.split(",");
+    if(parts.length>2)v=parts[0]+","+parts.slice(1).join("");
+    // Limit decimals to 2
+    if(parts.length===2&&parts[1].length>2)v=parts[0]+","+parts[1].slice(0,2);
+    // Format integer part with dots
+    const intPart=parts[0].replace(/^0+(?=\d)/,"");
+    const formatted=intPart.replace(/\B(?=(\d{3})+(?!\d))/g,".");
+    setPxRaw(parts.length===2?formatted+","+parts[1]:formatted);
+  };
+
   const monto=useMemo(()=>{
-    if(!vnRaw||!px)return null;
-    const v=parseInt(vnRaw,10),p=parseFloat(px);
-    if(isNaN(v)||isNaN(p)||v<=0||p<=0)return null;
-    const val=(p/100)*v;
+    if(!vnRaw||!pxRaw)return null;
+    const v=parseInt(vnRaw,10);
+    if(isNaN(v)||isNaN(pxNum)||v<=0||pxNum<=0)return null;
+    const val=(pxNum/100)*v;
     return type==="COMPRA"?-val:val;
-  },[vnRaw,px,type]);
+  },[vnRaw,pxRaw,pxNum,type]);
 
   const pickSug=(inst)=>{setTicker(inst.ticker);setShowSug(false);setSugIdx(0);setTimeout(()=>vnRef.current?.focus(),50);};
   const handleTickerChange=(e)=>{const v=e.target.value.toUpperCase();setTicker(v);setShowSug(v.length>0);setSugIdx(0);};
@@ -497,20 +778,19 @@ function NewOpRow({allTickers,onAdd}){
   };
 
   const handleVnChange=(e)=>{
-    // Strip everything except digits
     const raw=e.target.value.replace(/[^0-9]/g,"");
     setVnRaw(raw);
   };
 
   const trySubmit=()=>{
-    if(!ticker||!vnRaw||!px)return;
+    if(!ticker||!vnRaw||!pxRaw)return;
     const m=allTickers.find(t=>t.ticker.toUpperCase()===ticker.toUpperCase());
     if(!m)return;
-    const v=parseInt(vnRaw,10),p=parseFloat(px);
-    if(isNaN(v)||isNaN(p)||v<=0||p<=0)return;
-    const mc=(p/100)*v;
-    onAdd({ticker:m.ticker,type,plazo,vn:v,px:p,monto:type==="COMPRA"?-mc:mc,currency:m.currency});
-    setTicker("");setVnRaw("");setPx("");setType("COMPRA");setPlazo("0");tickerRef.current?.focus();
+    const v=parseInt(vnRaw,10);
+    if(isNaN(v)||isNaN(pxNum)||v<=0||pxNum<=0)return;
+    const mc=(pxNum/100)*v;
+    onAdd({ticker:m.ticker,type,plazo,vn:v,px:pxNum,monto:type==="COMPRA"?-mc:mc,currency:m.currency});
+    setTicker("");setVnRaw("");setPxRaw("");setType("COMPRA");setPlazo("0");tickerRef.current?.focus();
   };
 
   const iS={padding:"8px 10px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none",width:"100%",boxSizing:"border-box"};
@@ -565,20 +845,20 @@ function NewOpRow({allTickers,onAdd}){
       <input ref={vnRef} type="text" inputMode="numeric" placeholder="VN" value={vnDisplay}
         onChange={handleVnChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()}
         style={{...iS,textAlign:"right"}} autoComplete="off"/>
-      {/* PX */}
-      <input type="number" placeholder="PX" step="0.01" value={px}
-        onChange={e=>setPx(e.target.value)} onKeyDown={e=>e.key==="Enter"&&trySubmit()}
-        style={{...iS,textAlign:"right"}}/>
+      {/* PX formatted */}
+      <input type="text" inputMode="decimal" placeholder="PX" value={pxRaw}
+        onChange={handlePxChange} onKeyDown={e=>e.key==="Enter"&&trySubmit()}
+        style={{...iS,textAlign:"right"}} autoComplete="off"/>
       {/* MONTO */}
       <div style={{textAlign:"right",fontSize:13,fontWeight:600,padding:"0 4px",color:monto===null?"#4a5568":monto>=0?"#68d391":"#fc8181"}}>
         {monto!==null?fmtMoney(monto):"\u2014"}
       </div>
       {/* ADD */}
       <div style={{textAlign:"center"}}>
-        <button onClick={trySubmit} disabled={!ticker||!vnRaw||!px} style={{
-          background:ticker&&vnRaw&&px?"linear-gradient(135deg,#3182ce,#63b3ed)":"#2d3748",
-          border:"none",borderRadius:6,color:ticker&&vnRaw&&px?"#fff":"#4a5568",
-          cursor:ticker&&vnRaw&&px?"pointer":"not-allowed",
+        <button onClick={trySubmit} disabled={!ticker||!vnRaw||!pxRaw} style={{
+          background:ticker&&vnRaw&&pxRaw?"linear-gradient(135deg,#3182ce,#63b3ed)":"#2d3748",
+          border:"none",borderRadius:6,color:ticker&&vnRaw&&pxRaw?"#fff":"#4a5568",
+          cursor:ticker&&vnRaw&&pxRaw?"pointer":"not-allowed",
           padding:"7px 10px",fontSize:14,fontWeight:700,fontFamily:"inherit",
         }}>+</button>
       </div>
@@ -602,12 +882,12 @@ function BaseInstrumentos({instruments,setInstruments}){
   return(
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
-        <div style={{fontSize:14,color:"#a0aec0"}}>Base de datos de instrumentos por familia</div>
-        <button onClick={()=>setShowAF(!showAF)} style={{padding:"8px 16px",background:"rgba(99,179,237,0.1)",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#63b3ed",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>+ Nueva Familia</button>
+        <div style={{fontSize:14,color:"#a0aec0"}}>Base de datos de instrumentos por curva</div>
+        <button onClick={()=>setShowAF(!showAF)} style={{padding:"8px 16px",background:"rgba(99,179,237,0.1)",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#63b3ed",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>+ Nueva Curva</button>
       </div>
       {showAF&&(
         <div style={{padding:16,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.15)",marginBottom:16,display:"flex",gap:12,alignItems:"center"}}>
-          <input value={nf} onChange={e=>setNf(e.target.value)} placeholder="Nombre de familia..." style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none",flex:1}} onKeyDown={e=>e.key==="Enter"&&addFam()}/>
+          <input value={nf} onChange={e=>setNf(e.target.value)} placeholder="Nombre de curva..." style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none",flex:1}} onKeyDown={e=>e.key==="Enter"&&addFam()}/>
           <button onClick={addFam} style={{padding:"8px 20px",background:"#3182ce",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Agregar</button>
         </div>
       )}
@@ -636,6 +916,121 @@ function BaseInstrumentos({instruments,setInstruments}){
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+// ============================================================
+// AUDITORÍA
+// ============================================================
+function Auditoria({operations}){
+  const today=fmtD(new Date());
+  const[fromDate,setFromDate]=useState(today);
+  const[toDate,setToDate]=useState(today);
+  const[view,setView]=useState(null);// null | "ops"
+
+  const filtered=useMemo(()=>{
+    if(!fromDate||!toDate)return[];
+    return operations.filter(o=>o.date>=fromDate&&o.date<=toDate).sort((a,b)=>a.date.localeCompare(b.date));
+  },[operations,fromDate,toDate]);
+
+  const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
+  return(
+    <div>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Consultá operaciones registradas por rango de fechas</div>
+
+      {/* Date range selector */}
+      <div style={{display:"flex",alignItems:"center",gap:16,marginBottom:20,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <label style={{fontSize:11,color:"#718096",textTransform:"uppercase",letterSpacing:"1px"}}>Desde</label>
+          <input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)}
+            style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none"}}/>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <label style={{fontSize:11,color:"#718096",textTransform:"uppercase",letterSpacing:"1px"}}>Hasta</label>
+          <input type="date" value={toDate} onChange={e=>setToDate(e.target.value)}
+            style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.2)",borderRadius:8,color:"#f7fafc",fontSize:13,fontFamily:"inherit",outline:"none"}}/>
+        </div>
+        <button onClick={()=>setView("ops")} style={{padding:"8px 20px",borderRadius:8,border:"none",background:"#3182ce",color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+          Ver operaciones
+        </button>
+        {view==="ops"&&filtered.length>0&&(
+          <button onClick={()=>downloadAuditCSV(filtered,fromDate,toDate)} style={{padding:"8px 20px",borderRadius:8,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:4}}>
+            ⬇ Descargar Excel
+          </button>
+        )}
+      </div>
+
+      {/* Results */}
+      {view==="ops"&&(
+        <div>
+          <div style={{marginBottom:12,fontSize:12,color:"#718096"}}>
+            {filtered.length} operación{filtered.length!==1?"es":""} entre {fmtDD(fromDate)} y {fmtDD(toDate)}
+          </div>
+
+          {filtered.length===0?(
+            <div style={{padding:"40px 20px",textAlign:"center",color:"#4a5568",fontSize:13,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)"}}>
+              No hay operaciones en este período
+            </div>
+          ):(
+            <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+              <table style={{width:"100%",borderCollapse:"collapse"}}>
+                <thead>
+                  <tr>
+                    <th style={hdS}>F. Concertación</th>
+                    <th style={hdS}>F. Liquidación</th>
+                    <th style={hdS}>Ticker</th>
+                    <th style={hdS}>Tipo</th>
+                    <th style={hdS}>Moneda</th>
+                    <th style={{...hdS,textAlign:"right"}}>VN</th>
+                    <th style={{...hdS,textAlign:"right"}}>PX</th>
+                    <th style={{...hdS,textAlign:"right"}}>Monto</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.map((op,i)=>{
+                    const fConc=fmtDD(op.date);
+                    const fLiq=op.plazo==="0"?fmtDD(op.date):fmtDD(getNextBusinessDay(op.date));
+                    const isC=op.type==="COMPRA";
+                    return(
+                      <tr key={op.id||i} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                        <td style={cellS}>{fConc}</td>
+                        <td style={cellS}>{fLiq}</td>
+                        <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{op.ticker}</td>
+                        <td style={cellS}>
+                          <span style={{padding:"3px 10px",borderRadius:4,fontSize:10,fontWeight:600,background:isC?"rgba(72,187,120,0.15)":"rgba(245,101,101,0.15)",color:isC?"#68d391":"#fc8181"}}>{op.type}</span>
+                        </td>
+                        <td style={cellS}>
+                          <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700,background:op.currency==="ARS"?"rgba(99,179,237,0.1)":op.currency==="MEP"?"rgba(72,187,120,0.1)":"rgba(237,137,54,0.1)",color:op.currency==="ARS"?"#63b3ed":op.currency==="MEP"?"#68d391":"#ed8936"}}>{op.currency}</span>
+                        </td>
+                        <td style={{...cellS,textAlign:"right"}}>{fmtNum(op.vn)}</td>
+                        <td style={{...cellS,textAlign:"right"}}>{Number(op.px).toFixed(2)}</td>
+                        <td style={{...cellS,textAlign:"right",fontWeight:600,color:op.monto>=0?"#68d391":"#fc8181"}}>{fmtMoney(op.monto)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              {/* Totals */}
+              <div style={{padding:"12px 20px",background:"#0d1220",borderTop:"1px solid rgba(99,179,237,0.1)",display:"flex",justifyContent:"flex-end",gap:24}}>
+                {["ARS","MEP","CCL"].map(cur=>{
+                  const total=filtered.filter(o=>o.currency===cur).reduce((s,o)=>s+o.monto,0);
+                  if(total===0)return null;
+                  return(
+                    <div key={cur} style={{fontSize:12,display:"flex",alignItems:"center",gap:6}}>
+                      <span style={{fontSize:10,fontWeight:700,color:cur==="ARS"?"#63b3ed":cur==="MEP"?"#68d391":"#ed8936"}}>{cur}</span>
+                      <span style={{fontWeight:600,color:total>=0?"#68d391":"#fc8181"}}>{fmtMoney(total)}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
