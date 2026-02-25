@@ -11,11 +11,13 @@ RUN npm run build
 FROM python:3.11-slim
 WORKDIR /app
 
-# Install Python deps (requests first since PyOBD's setup.py imports it)
+# Install Python deps
+# PyOBD's setup.py imports its own package (which needs requests, pytz, etc.)
+# So we pre-install all its runtime deps, then install PyOBD with --no-build-isolation
 COPY server/requirements.txt ./requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
-RUN pip install --no-cache-dir requests pandas
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir requests pandas pytz beautifulsoup4 lxml setuptools
+RUN pip install --no-cache-dir --no-build-isolation -r requirements.txt
 
 # Copy backend code
 COPY server/ ./
