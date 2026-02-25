@@ -101,10 +101,18 @@ _FIELD_MAP = {
     "symbol": ["symbol", "simbolo", "ticker", "Symbol", "SYMBOL"],
     "last": ["last", "ultimo", "price", "px_last", "Last", "LAST", "ultimoPrecio"],
     "bid": ["bid", "puntaCompra", "bestBid", "Bid", "BID", "precioCompra"],
-    "offer": ["offer", "puntaVenta", "bestAsk", "ask", "Ask", "Offer", "OFFER", "precioVenta"],
-    "vol_amount": ["monto", "volumenMonto", "amount", "MontoOperado", "montoOperado", "tradeAmount"],
+    "offer": ["ask", "offer", "puntaVenta", "bestAsk", "Ask", "Offer", "OFFER", "precioVenta"],
+    "vol_amount": ["turnover", "monto", "volumenMonto", "amount", "MontoOperado", "montoOperado", "tradeAmount"],
     "vol_vn": ["volume", "volumen", "nominal", "vn", "volumenNominal", "Volume", "VOLUME", "cantidadOperada"],
-    "vwap": ["vwap", "VWAP", "precioPromedioPonderado", "avgPrice", "precioProm"],
+    "close": ["close", "cierre", "Close"],
+    "open": ["open", "apertura", "Open"],
+    "high": ["high", "maximo", "High"],
+    "low": ["low", "minimo", "Low"],
+    "change": ["change", "variacion", "Change"],
+    "previous_close": ["previous_close", "cierreAnterior"],
+    "bid_size": ["bid_size", "bidSize"],
+    "ask_size": ["ask_size", "askSize"],
+    "operations": ["operations", "operaciones"],
     "description": ["description", "descripcion", "name", "denominacion", "Descripcion"],
     "settlement": ["settlement", "plazo", "vencimiento", "settl"],
 }
@@ -116,7 +124,7 @@ def _extract_field(row, field_name):
     for key in candidates:
         if key in row:
             val = row[key]
-            if val is not None and val != "" and val != 0:
+            if val is not None and val != "":
                 return val
     return None
 
@@ -125,8 +133,7 @@ def _safe_float(val):
     if val is None:
         return None
     try:
-        f = float(val)
-        return f if f != 0 else None
+        return float(val)
     except (ValueError, TypeError):
         return None
 
@@ -157,13 +164,21 @@ def quotes_for(symbols: list[str]) -> dict:
         key = symbol.upper().strip()
         if key in lookup:
             row = lookup[key]
+            vol_amount = _safe_float(_extract_field(row, "vol_amount"))
+            vol_vn = _safe_float(_extract_field(row, "vol_vn"))
+            # VWAP = turnover / volume (if both exist and volume > 0)
+            vwap = None
+            if vol_amount and vol_vn and vol_vn > 0:
+                vwap = round(vol_amount / vol_vn, 4)
             results[symbol] = {
                 "last": _safe_float(_extract_field(row, "last")),
                 "bid": _safe_float(_extract_field(row, "bid")),
                 "offer": _safe_float(_extract_field(row, "offer")),
-                "vol_amount": _safe_float(_extract_field(row, "vol_amount")),
-                "vol_vn": _safe_float(_extract_field(row, "vol_vn")),
-                "vwap": _safe_float(_extract_field(row, "vwap")),
+                "vol_amount": vol_amount,
+                "vol_vn": vol_vn,
+                "vwap": vwap,
+                "close": _safe_float(_extract_field(row, "close")),
+                "change": _safe_float(_extract_field(row, "change")),
                 "source": "open-bymadata",
             }
         else:
