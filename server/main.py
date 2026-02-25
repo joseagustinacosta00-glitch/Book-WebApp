@@ -92,6 +92,53 @@ def list_entries():
     return {"entries": members}
 
 
+# ── BYMA Open Data Endpoints ────────────────────────────────
+
+import byma_open_client as byma
+
+@app.get("/api/byma/health")
+def byma_health():
+    return byma.health()
+
+
+@app.get("/api/byma/quotes")
+def byma_quotes(symbols: str = Query(..., description="Comma-separated tickers")):
+    """Always returns 200. Per-symbol errors in each symbol's 'error' field."""
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        return {"asof": datetime.now(timezone.utc).isoformat(), "source": "open-bymadata (delayed)", "symbols": {}}
+    if len(symbol_list) > 100:
+        symbol_list = symbol_list[:100]
+
+    try:
+        data = byma.quotes_for(symbol_list)
+    except Exception as e:
+        data = {s: {"error": str(e)} for s in symbol_list}
+
+    return {
+        "asof": datetime.now(timezone.utc).isoformat(),
+        "source": "open-bymadata (delayed)",
+        "symbols": data,
+    }
+
+
+@app.get("/api/byma/raw")
+def byma_raw(symbol: str = Query(..., description="Single ticker")):
+    """Raw PyOBD row for debugging field names."""
+    return byma.raw_row(symbol.strip().upper())
+
+
+@app.get("/api/byma/bonds")
+def byma_bonds(q: str = Query("", description="Filter text"), limit: int = Query(200)):
+    """List available bonds from Open BYMA, optionally filtered."""
+    bonds = byma.list_bonds(q, limit)
+    return {
+        "total": len(bonds),
+        "filter": q,
+        "bonds": bonds,
+    }
+
+
 # ── Serve Frontend Static Files ──────────────────────────────
 DIST_DIR = Path(__file__).parent / "dist"
 

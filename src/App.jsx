@@ -131,7 +131,7 @@ export default function App(){
   useEffect(()=>{saveS("i1",instruments);},[instruments]);
   useEffect(()=>{saveS("o1",operations);},[operations]);
   useEffect(()=>{saveS("fx1",fxOps);},[fxOps]);
-  const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>its.forEach(i=>l.push({...i,family:f})));return l;},[instruments]);
+  const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>{if(f==="Monedas")return;its.forEach(i=>l.push({...i,family:f}));});return l;},[instruments]);
 
   const tabs=[
     {id:"dashboard",label:"Dashboard",icon:"\u{1F4CA}"},
@@ -202,11 +202,11 @@ function Dashboard({operations,fxOps}){
   // T+1: ops dated today with plazo 1
   const opsT1=operations.filter(o=>o.date===selDate&&o.plazo==="1");
   const fxT1=(fxOps||[]).filter(o=>o.date===selDate&&o.plazo==="1");
-  // Maturity: ALL ops up to and including today
-  const allOps=operations.filter(o=>o.date<=selDate);
-  const allFx=(fxOps||[]).filter(o=>o.date<=selDate);
+  // Maturity: T+0 + T+1 combined (all of today's ops, both plazos)
+  const opsMaturity=operations.filter(o=>o.date===selDate);
+  const fxMaturity=(fxOps||[]).filter(o=>o.date===selDate);
 
-  const maturity=compute(allOps,allFx);
+  const maturity=compute(opsMaturity,fxMaturity);
   const t0data=compute(opsT0,fxT0);
   const t1data=compute(opsT1,fxT1);
 
@@ -228,7 +228,7 @@ function Dashboard({operations,fxOps}){
         </div>
       )}
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:20}}>
-        <ConsolidatedPanel title="Posición a Maturity" subtitle="Consolidado total" data={maturity} accent="#a78bfa"/>
+        <ConsolidatedPanel title="Posición a Maturity" subtitle={"Neto del día — "+fmtDD(selDate)} data={maturity} accent="#a78bfa"/>
         <ConsolidatedPanel title="Liquidación T+0" subtitle={fmtDD(selDate)} data={t0data} accent="#63b3ed"/>
         <ConsolidatedPanel title="Liquidación T+1" subtitle={fmtDD(nextBD)} data={t1data} accent="#ed8936"/>
       </div>
@@ -529,7 +529,7 @@ function RegistroOps({operations,setOperations,allTickers}){
     doAddOp(op);
   };
   const doAddOp=(op)=>{
-    setOperations(p=>[...p,{...op,id:Date.now().toString(),date:selDate}]);
+    setOperations(p=>[...p,{...op,id:Date.now().toString()+"-"+Math.random().toString(36).slice(2,6),date:selDate}]);
     setConfirmPending(null);
   };
   const removeOp=(id)=>{
@@ -884,10 +884,51 @@ function BaseInstrumentos({instruments,setInstruments}){
   const[nc,setNc]=useState("ARS");
   const[nf,setNf]=useState("");
   const[showAF,setShowAF]=useState(false);
+  // BYMA Open Tools state
+  const[bymaQuery,setBymaQuery]=useState("");
+  const[bymaResults,setBymaResults]=useState(null);
+  const[bymaLoading,setBymaLoading]=useState(false);
+  const[bymaPrices,setBymaPrices]=useState(null);
+  const[bymaPricesFam,setBymaPricesFam]=useState(null);
+  const[bymaPricesLoading,setBymaPricesLoading]=useState(false);
+
   const addInst=(fam)=>{if(!nt||instruments[fam].some(i=>i.ticker.toUpperCase()===nt.toUpperCase()))return;setInstruments(p=>({...p,[fam]:[...p[fam],{ticker:nt.toUpperCase(),currency:nc}]}));setNt("");setNc("ARS");};
   const remInst=(fam,t)=>setInstruments(p=>({...p,[fam]:p[fam].filter(i=>i.ticker!==t)}));
   const addFam=()=>{if(!nf||instruments[nf])return;setInstruments(p=>({...p,[nf]:[]}));setNf("");setShowAF(false);};
+
+  const searchBYMA=async()=>{
+    if(!bymaQuery.trim())return;
+    setBymaLoading(true);setBymaResults(null);
+    try{
+      const r=await fetch("/api/byma/bonds?q="+encodeURIComponent(bymaQuery.trim()));
+      const data=await r.json();
+      setBymaResults(data.bonds||[]);
+    }catch(e){setBymaResults([]);}
+    setBymaLoading(false);
+  };
+
+  const fetchBymaPrices=async(fam)=>{
+    const tickers=instruments[fam];
+    if(!tickers||tickers.length===0)return;
+    setBymaPricesLoading(true);setBymaPrices(null);setBymaPricesFam(fam);
+    try{
+      const syms=tickers.map(t=>t.ticker).join(",");
+      const r=await fetch("/api/byma/quotes?symbols="+encodeURIComponent(syms));
+      const data=await r.json();
+      setBymaPrices(data.symbols||{});
+    }catch(e){setBymaPrices({});}
+    setBymaPricesLoading(false);
+  };
+
+  const importFromBYMA=(fam,symbol)=>{
+    if(instruments[fam].some(i=>i.ticker.toUpperCase()===symbol.toUpperCase()))return;
+    setInstruments(p=>({...p,[fam]:[...p[fam],{ticker:symbol.toUpperCase(),currency:"ARS"}]}));
+  };
+
   const cc={ARS:{bg:"rgba(99,179,237,0.12)",color:"#63b3ed",border:"rgba(99,179,237,0.25)"},MEP:{bg:"rgba(72,187,120,0.12)",color:"#68d391",border:"rgba(72,187,120,0.25)"},CCL:{bg:"rgba(237,137,54,0.12)",color:"#ed8936",border:"rgba(237,137,54,0.25)"}};
+  const cellS={padding:"6px 10px",fontSize:11,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:9,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
   return(
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
@@ -905,7 +946,10 @@ function BaseInstrumentos({instruments,setInstruments}){
           <div key={fam} style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
             <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
               <div style={{fontSize:14,fontWeight:700,color:"#f7fafc",display:"flex",alignItems:"center",gap:10}}>{fam}<span style={{fontSize:10,color:"#718096",fontWeight:400,background:"rgba(99,179,237,0.08)",padding:"2px 8px",borderRadius:4}}>{instruments[fam].length}</span></div>
-              <button onClick={()=>setEditFam(editFam===fam?null:fam)} style={{background:"none",border:"none",cursor:"pointer",fontSize:16,padding:"4px 8px",borderRadius:4,color:editFam===fam?"#63b3ed":"#718096"}}>{"\u270F\uFE0F"}</button>
+              <div style={{display:"flex",gap:6,alignItems:"center"}}>
+                {fam!=="Monedas"&&<button onClick={()=>fetchBymaPrices(fam)} style={{background:"none",border:"1px solid rgba(237,137,54,0.25)",borderRadius:4,color:"#ed8936",fontSize:10,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit"}} title="Traer precios BYMA Open">📊 Precios BYMA</button>}
+                <button onClick={()=>setEditFam(editFam===fam?null:fam)} style={{background:"none",border:"none",cursor:"pointer",fontSize:16,padding:"4px 8px",borderRadius:4,color:editFam===fam?"#63b3ed":"#718096"}}>{"\u270F\uFE0F"}</button>
+              </div>
             </div>
             <div style={{padding:"12px 20px",display:"flex",flexWrap:"wrap",gap:8}}>
               {instruments[fam].map(inst=>{const c=cc[inst.currency]||cc.ARS;return(
@@ -922,8 +966,87 @@ function BaseInstrumentos({instruments,setInstruments}){
                 <button onClick={()=>addInst(fam)} style={{padding:"7px 16px",background:"#3182ce",border:"none",borderRadius:6,color:"#fff",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Agregar</button>
               </div>
             )}
+
+            {/* BYMA Prices inline for this family */}
+            {bymaPricesFam===fam&&bymaPrices&&(
+              <div style={{padding:"12px 20px",borderTop:"1px solid rgba(237,137,54,0.15)",background:"rgba(237,137,54,0.03)"}}>
+                <div style={{fontSize:10,color:"#ed8936",fontWeight:600,marginBottom:8}}>⏱️ Precios BYMA Open (delay ~20 min)</div>
+                <table style={{width:"100%",borderCollapse:"collapse"}}>
+                  <thead><tr>
+                    <th style={hdS}>Ticker</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={{...hdS,textAlign:"right"}}>Bid</th><th style={{...hdS,textAlign:"right"}}>Offer</th><th style={{...hdS,textAlign:"right"}}>Vol VN</th><th style={{...hdS,textAlign:"right"}}>Monto</th><th style={{...hdS,textAlign:"center",width:30}}></th>
+                  </tr></thead>
+                  <tbody>
+                    {instruments[fam].map(inst=>{
+                      const q=bymaPrices[inst.ticker]||{};
+                      const fP=v=>v!=null?Number(v).toFixed(2):"—";
+                      return(<tr key={inst.ticker} style={{opacity:q.error?0.5:1}}>
+                        <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{inst.ticker}</td>
+                        <td style={{...cellS,textAlign:"right",color:q.last!=null?"#f6e05e":"#4a5568"}}>{fP(q.last)}</td>
+                        <td style={{...cellS,textAlign:"right",color:q.bid!=null?"#48bb78":"#4a5568"}}>{fP(q.bid)}</td>
+                        <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fP(q.offer)}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"—"}</td>
+                        <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):"—"}</td>
+                        <td style={{...cellS,textAlign:"center"}}>{q.error?<span title={q.error} style={{color:"#fc8181",cursor:"help",fontSize:10}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78",fontSize:10}}>✓</span>:"—"}</td>
+                      </tr>);
+                    })}
+                  </tbody>
+                </table>
+                <button onClick={()=>{setBymaPrices(null);setBymaPricesFam(null);}} style={{marginTop:6,background:"none",border:"none",color:"#718096",fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>✕ Cerrar</button>
+              </div>
+            )}
           </div>
         ))}
+      </div>
+
+      {/* ── Open BYMA Tools ─────────────────────────────── */}
+      <div style={{marginTop:28,background:"#111827",borderRadius:12,border:"1px solid rgba(237,137,54,0.2)",overflow:"hidden"}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(237,137,54,0.1)",display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:16}}>🔍</span>
+          <span style={{fontSize:13,fontWeight:700,color:"#ed8936"}}>Open BYMA Tools</span>
+          <span style={{fontSize:10,color:"#a0aec0"}}>(delay ~20 min, sin credenciales)</span>
+        </div>
+        <div style={{padding:"16px 20px"}}>
+          {/* Search / Validate */}
+          <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:12}}>
+            <input value={bymaQuery} onChange={e=>setBymaQuery(e.target.value.toUpperCase())} placeholder="Buscar ticker en Open BYMA (ej: AL30, GD35)..." style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(237,137,54,0.2)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",flex:1}} onKeyDown={e=>e.key==="Enter"&&searchBYMA()}/>
+            <button onClick={searchBYMA} disabled={bymaLoading} style={{padding:"8px 20px",background:"rgba(237,137,54,0.15)",border:"1px solid rgba(237,137,54,0.3)",borderRadius:6,color:"#ed8936",fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{bymaLoading?"Buscando...":"Buscar"}</button>
+          </div>
+
+          {/* Results table */}
+          {bymaResults!==null&&(
+            <div>
+              {bymaResults.length===0?(
+                <div style={{padding:16,textAlign:"center",color:"#4a5568",fontSize:12}}>No se encontraron resultados para "{bymaQuery}"</div>
+              ):(
+                <div style={{maxHeight:300,overflowY:"auto"}}>
+                  <div style={{fontSize:10,color:"#718096",marginBottom:6}}>{bymaResults.length} resultado{bymaResults.length!==1?"s":""}</div>
+                  <table style={{width:"100%",borderCollapse:"collapse"}}>
+                    <thead><tr>
+                      <th style={hdS}>Símbolo</th><th style={{...hdS,textAlign:"right"}}>Last</th><th style={hdS}>Settlement</th><th style={hdS}>Descripción</th><th style={{...hdS,textAlign:"center",width:100}}>Importar a</th>
+                    </tr></thead>
+                    <tbody>
+                      {bymaResults.map((b,i)=>(
+                        <tr key={i} style={{transition:"background 0.1s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(237,137,54,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                          <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{b.symbol}</td>
+                          <td style={{...cellS,textAlign:"right",color:b.last!=null?"#f6e05e":"#4a5568"}}>{b.last!=null?Number(b.last).toFixed(2):"—"}</td>
+                          <td style={{...cellS,color:"#a0aec0"}}>{b.settlement||"—"}</td>
+                          <td style={{...cellS,color:"#a0aec0",fontSize:10,maxWidth:200,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{b.description||"—"}</td>
+                          <td style={{...cellS,textAlign:"center"}}>
+                            <select onChange={e=>{if(e.target.value)importFromBYMA(e.target.value,b.symbol);e.target.value="";}} defaultValue="" style={{padding:"3px 6px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:4,color:"#63b3ed",fontSize:10,fontFamily:"inherit",outline:"none",cursor:"pointer"}}>
+                              <option value="" disabled>Curva...</option>
+                              {Object.keys(instruments).filter(f=>f!=="Monedas").map(f=><option key={f} value={f}>{f}</option>)}
+                            </select>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <button onClick={()=>setBymaResults(null)} style={{marginTop:8,background:"none",border:"none",color:"#718096",fontSize:10,cursor:"pointer",fontFamily:"inherit"}}>✕ Cerrar resultados</button>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -1224,6 +1347,7 @@ function Mercado(){
   const[intervalIdx,setIntervalIdx]=useState(1);// default 5 min
   const[lastUpdate,setLastUpdate]=useState(null);
   const[mktOpen,setMktOpen]=useState(isMarketOpen());
+  const[source,setSource]=useState("rofex");// "rofex" | "byma"
   const timerRef=useRef(null);
   const mktCheckRef=useRef(null);
 
@@ -1233,7 +1357,8 @@ function Mercado(){
     setStatus("loading");
     setErrorMsg("");
     try{
-      const r=await fetch("/api/quotes?symbols="+encodeURIComponent(syms));
+      const endpoint=source==="byma"?"/api/byma/quotes":"/api/quotes";
+      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(syms));
       const data=await r.json();
       const symsData=data.symbols||{};
       setQuotes(symsData);
@@ -1262,25 +1387,34 @@ function Mercado(){
     return()=>clearInterval(mktCheckRef.current);
   },[]);
 
-  // Fetch on curve change or interval change
+  // Fetch on curve change, interval change, or source change
   useEffect(()=>{
     fetchQuotes();
     clearInterval(timerRef.current);
-    const ms=INTERVALS[intervalIdx].ms;
+    const ms=source==="byma"?Math.max(INTERVALS[intervalIdx].ms,30000):INTERVALS[intervalIdx].ms;
     timerRef.current=setInterval(fetchQuotes,ms);
     return()=>clearInterval(timerRef.current);
-  },[activeCurve,intervalIdx]);
+  },[activeCurve,intervalIdx,source]);
 
   const statusColor=status==="ok"?"#48bb78":status==="error"?"#fc8181":status==="loading"?"#f6e05e":"#a0aec0";
 
   const cellS={padding:"8px 12px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
   const btnS=(active)=>({padding:"6px 14px",borderRadius:4,border:active?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:active?"rgba(49,130,206,0.15)":"transparent",color:active?"#63b3ed":"#718096",fontSize:10,fontWeight:active?600:400,cursor:"pointer",fontFamily:"inherit"});
+  const srcBtnS=(active,color)=>({padding:"6px 14px",borderRadius:4,border:active?`1px solid ${color}`:"1px solid rgba(99,179,237,0.15)",background:active?`${color}22`:"transparent",color:active?color:"#718096",fontSize:10,fontWeight:active?700:400,cursor:"pointer",fontFamily:"inherit"});
 
   return(
     <div>
+      {/* BYMA delay banner */}
+      {source==="byma"&&(
+        <div style={{marginBottom:16,padding:"10px 20px",background:"rgba(237,137,54,0.08)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:16}}>⏱️</span>
+          <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>BYMA Open — Datos con delay ~20 min <span style={{fontWeight:400,color:"#a0aec0"}}>(sin credenciales)</span></div>
+        </div>
+      )}
+
       {/* Market status banner */}
-      {!mktOpen&&(
+      {!mktOpen&&source==="rofex"&&(
         <div style={{marginBottom:16,padding:"12px 20px",background:"rgba(246,224,94,0.08)",border:"1px solid rgba(246,224,94,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:18}}>🔒</span>
           <div>
@@ -1290,14 +1424,24 @@ function Mercado(){
         </div>
       )}
 
-      {/* Sub-tabs for curves */}
-      <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>
-        {curveKeys.map(k=>(
-          <button key={k} onClick={()=>setActiveCurve(k)}
-            style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
-            {curves[k].label}
-          </button>
-        ))}
+      {/* Source toggle + Sub-tabs for curves */}
+      <div style={{display:"flex",gap:16,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+        {/* Source selector */}
+        <div style={{display:"flex",gap:4,alignItems:"center",padding:"4px 6px",background:"rgba(99,179,237,0.04)",borderRadius:6,border:"1px solid rgba(99,179,237,0.08)"}}>
+          <span style={{fontSize:10,color:"#718096",marginRight:4}}>Fuente:</span>
+          <button onClick={()=>setSource("rofex")} style={srcBtnS(source==="rofex","#63b3ed")}>ROFEX</button>
+          <button onClick={()=>setSource("byma")} style={srcBtnS(source==="byma","#ed8936")}>BYMA Open</button>
+        </div>
+
+        {/* Curve tabs */}
+        <div style={{display:"flex",gap:4}}>
+          {curveKeys.map(k=>(
+            <button key={k} onClick={()=>setActiveCurve(k)}
+              style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+              {curves[k].label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Controls bar */}
@@ -1306,7 +1450,7 @@ function Mercado(){
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
           <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
-            {status==="ok"?(mktOpen?"LIVE":"OK"):status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
+            {status==="ok"?(source==="byma"?"DELAYED":mktOpen?"LIVE":"OK"):status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
           </span>
         </div>
 
@@ -1344,7 +1488,7 @@ function Mercado(){
               <th style={{...hdS,textAlign:"right"}}>Offer</th>
               <th style={{...hdS,textAlign:"right"}}>Spread</th>
               <th style={{...hdS,textAlign:"right"}}>Vol VN</th>
-              <th style={{...hdS,textAlign:"right"}}>Eff Vol</th>
+              <th style={{...hdS,textAlign:"right"}}>{source==="byma"?"Monto":"Eff Vol"}</th>
               <th style={{...hdS,textAlign:"center",width:40}}></th>
             </tr>
           </thead>
@@ -1354,6 +1498,7 @@ function Mercado(){
               const hasError=!!q.error;
               const spread=(q.bid!=null&&q.offer!=null)?(q.offer-q.bid).toFixed(2):"\u2014";
               const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"\u2014";
+              const lastCol=source==="byma"?(q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):"\u2014"):(q.effective_volume!=null?fmtNum(Math.round(q.effective_volume)):"\u2014");
               return(
                 <tr key={s.display} style={{transition:"background 0.15s",opacity:hasError?0.5:1}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} title={hasError?q.error:(q.resolved_ticker||"")}>
                   <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{s.display}</td>
@@ -1362,7 +1507,7 @@ function Mercado(){
                   <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fmtPx(q.offer)}</td>
                   <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{spread}</td>
                   <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"\u2014"}</td>
-                  <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.effective_volume!=null?fmtNum(Math.round(q.effective_volume)):"\u2014"}</td>
+                  <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{lastCol}</td>
                   <td style={{...cellS,textAlign:"center"}}>{hasError?<span title={q.error} style={{color:"#fc8181",cursor:"help"}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78"}}>✓</span>:<span style={{color:"#4a5568"}}>—</span>}</td>
                 </tr>
               );
@@ -1373,7 +1518,7 @@ function Mercado(){
 
       {/* Debug links */}
       <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
-        Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/health</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/debug/AL30</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/instruments?q=AL30</code>
+        Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/health</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{source==="byma"?"/api/byma/raw?symbol=AL30":"/api/debug/AL30"}</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{source==="byma"?"/api/byma/bonds?q=AL30":"/api/instruments?q=AL30"}</code>
       </div>
     </div>
   );
