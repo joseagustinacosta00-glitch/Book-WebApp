@@ -55,14 +55,50 @@ def _cache_set(key, data):
     _cache[key] = {"data": data, "ts": time.time()}
 
 
+# ── Market hours check ───────────────────────────────────────
+# Argentine holidays 2026 (BYMA closed)
+_AR_HOLIDAYS_2026 = {
+    "2026-01-01","2026-02-16","2026-02-17","2026-03-23","2026-03-24",
+    "2026-04-02","2026-04-03","2026-05-01","2026-05-25","2026-06-15",
+    "2026-07-09","2026-07-10","2026-08-17","2026-10-12","2026-11-06",
+    "2026-11-23","2026-12-07","2026-12-08","2026-12-24","2026-12-25",
+    "2026-12-31",
+}
+
+def _is_market_hours():
+    """Check if we're within Argentine business hours (10:45-17:00 Mon-Fri, not holiday)."""
+    from datetime import datetime, timezone, timedelta
+    # Argentina is UTC-3, no DST
+    now_utc = datetime.now(timezone.utc)
+    ar_time = now_utc + timedelta(hours=-3)
+    # Weekend?
+    if ar_time.weekday() >= 5:  # 5=Sat, 6=Sun
+        return False
+    # Holiday?
+    date_str = ar_time.strftime("%Y-%m-%d")
+    if date_str in _AR_HOLIDAYS_2026:
+        return False
+    # Time check: 10:45 to 17:00
+    minutes = ar_time.hour * 60 + ar_time.minute
+    return 645 <= minutes <= 1020  # 10:45=645, 17:00=1020
+
+
 # ── Core: fetch bonds ───────────────────────────────────────
 def _fetch_bonds_raw():
-    """Fetch all bonds from PyOBD. Returns list of dicts (raw rows)."""
+    """Fetch all bonds from PyOBD. Returns list of dicts (raw rows).
+    Only fetches during Argentine market hours to avoid errors."""
     global _sample_keys
 
     cached = _cache_get("bonds_raw")
     if cached is not None:
         return cached
+
+    # Outside market hours: return last known data or empty
+    if not _is_market_hours():
+        # Check if we have ANY cached data (even expired)
+        if "bonds_raw" in _cache:
+            return _cache["bonds_raw"]["data"]
+        raise RuntimeError("Mercado cerrado — fuera de horario hábil argentino (10:45-17:00 L-V)")
 
     if not _init_pyobd():
         raise RuntimeError(_init_error or "PyOBD not available")
@@ -70,6 +106,10 @@ def _fetch_bonds_raw():
     try:
         result = _obd.get_bonds()
     except Exception as e:
+        # On error, return stale cache if available
+        if "bonds_raw" in _cache:
+            print(f"  PyOBD get_bonds() error, using stale cache: {e}")
+            return _cache["bonds_raw"]["data"]
         raise RuntimeError(f"PyOBD get_bonds() failed: {e}")
 
     # result could be a DataFrame or list of dicts
@@ -275,12 +315,19 @@ _caucion_sample_keys = None
 
 def get_cauciones() -> list:
     """Fetch cauciones from Open BYMA Data (direct HTTP).
-    Returns list of dicts with parsed fields. Cached with TTL."""
+    Returns list of dicts with parsed fields. Cached with TTL.
+    Only fetches during market hours."""
     global _caucion_sample_keys
 
     cached = _cache_get("cauciones_raw")
     if cached is not None:
         return cached
+
+    # Outside market hours: return stale cache or empty
+    if not _is_market_hours():
+        if "cauciones_raw" in _cache:
+            return _cache["cauciones_raw"]["data"]
+        return []
 
     import requests
 

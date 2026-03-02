@@ -85,6 +85,22 @@ const INIT_INST = {
   Monedas:[{ticker:"MEP",currency:"USD"},{ticker:"CCL",currency:"USD"},{ticker:"CANJE",currency:"USD"}],
 };
 
+const INIT_TASAS = [
+  {date:"2026-01-02",rate:36.48},{date:"2026-01-05",rate:32.89},{date:"2026-01-06",rate:55.86},
+  {date:"2026-01-07",rate:38.15},{date:"2026-01-08",rate:31.32},{date:"2026-01-09",rate:29.43},
+  {date:"2026-01-12",rate:42.44},{date:"2026-01-13",rate:45.68},{date:"2026-01-14",rate:33.76},
+  {date:"2026-01-15",rate:35.49},{date:"2026-01-16",rate:34.73},{date:"2026-01-19",rate:30.82},
+  {date:"2026-01-20",rate:30.57},{date:"2026-01-21",rate:35.91},{date:"2026-01-22",rate:31.63},
+  {date:"2026-01-23",rate:23.63},{date:"2026-01-26",rate:19.45},{date:"2026-01-27",rate:20.46},
+  {date:"2026-01-28",rate:20.26},{date:"2026-01-29",rate:25.75},{date:"2026-01-30",rate:24.98},
+  {date:"2026-02-02",rate:41.26},{date:"2026-02-03",rate:33.69},{date:"2026-02-04",rate:27.95},
+  {date:"2026-02-05",rate:24.29},{date:"2026-02-06",rate:23.83},{date:"2026-02-09",rate:23.58},
+  {date:"2026-02-10",rate:21.95},{date:"2026-02-11",rate:21.89},{date:"2026-02-12",rate:25.16},
+  {date:"2026-02-13",rate:33.12},{date:"2026-02-18",rate:33.82},{date:"2026-02-19",rate:40.94},
+  {date:"2026-02-20",rate:41.03},{date:"2026-02-23",rate:34.95},{date:"2026-02-24",rate:26.12},
+  {date:"2026-02-25",rate:16.01},{date:"2026-02-26",rate:19.77},
+];
+
 function loadS(k,f){try{const r=localStorage.getItem(k);return r?JSON.parse(r):f;}catch{return f;}}
 function saveS(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch(e){console.warn(e);}}
 
@@ -128,9 +144,11 @@ export default function App(){
   const[instruments,setInstruments]=useState(()=>loadS("i1",INIT_INST));
   const[operations,setOperations]=useState(()=>loadS("o1",[]));
   const[fxOps,setFxOps]=useState(()=>loadS("fx1",[]));
+  const[tasas,setTasas]=useState(()=>loadS("tasas1",INIT_TASAS));
   useEffect(()=>{saveS("i1",instruments);},[instruments]);
   useEffect(()=>{saveS("o1",operations);},[operations]);
   useEffect(()=>{saveS("fx1",fxOps);},[fxOps]);
+  useEffect(()=>{saveS("tasas1",tasas);},[tasas]);
   const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>{if(f==="Monedas")return;its.forEach(i=>l.push({...i,family:f}));});return l;},[instruments]);
 
   const tabs=[
@@ -140,6 +158,7 @@ export default function App(){
     {id:"instrumentos",label:"Base de Instrumentos",icon:"\u{1F5C4}\uFE0F"},
     {id:"posicion",label:"Posición & PNL",icon:"\u{1F4B0}"},
     {id:"mercado",label:"Mercado",icon:"\u{1F4E1}"},
+    {id:"tasas",label:"Tasas",icon:"\u{1F4C8}"},
   ];
 
   return(
@@ -163,8 +182,9 @@ export default function App(){
         {tab==="blotter"&&<Blotter operations={operations} setOperations={setOperations} fxOps={fxOps} setFxOps={setFxOps} allTickers={allTickers}/>}
         {tab==="auditoria"&&<Auditoria operations={operations} fxOps={fxOps}/>}
         {tab==="instrumentos"&&<BaseInstrumentos instruments={instruments} setInstruments={setInstruments}/>}
-        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps}/>}
+        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas}/>}
         {tab==="mercado"&&<Mercado/>}
+        {tab==="tasas"&&<TasasFondeo tasas={tasas} setTasas={setTasas}/>}
       </main>
     </div>
   );
@@ -1170,24 +1190,112 @@ function Auditoria({operations,fxOps}){
 // ============================================================
 // POSICIÓN & PNL — Consolidated position across all dates
 // ============================================================
-function PosicionPNL({operations,fxOps}){
-  // Consolidate ALL title operations into net position per ticker
-  const positions=useMemo(()=>{
-    const pos={};// ticker -> {vn, compras, ventas, avgPx, currency, family}
-    for(const op of operations){
-      const key=op.ticker;
-      if(!pos[key])pos[key]={ticker:key,currency:op.currency||"ARS",vnNet:0,vnCompra:0,vnVenta:0,montoTotal:0};
-      if(op.type==="COMPRA"){
-        pos[key].vnNet+=op.vn;
-        pos[key].vnCompra+=op.vn;
+function PosicionPNL({operations,fxOps,tasas}){
+  const today=fmtD(new Date());
+  const[mktPrices,setMktPrices]=useState({});
+  const[mktLoading,setMktLoading]=useState(false);
+
+  // Build tasa lookup: date -> {rate, calDays}
+  // calDays = calendar days this rate covers (until next business day)
+  const tasaMap=useMemo(()=>{
+    const sorted=[...(tasas||[])].sort((a,b)=>a.date.localeCompare(b.date));
+    const map={};
+    for(let i=0;i<sorted.length;i++){
+      const t=sorted[i];
+      // calDays = days from this date to next business day (or next tasa date)
+      let calDays=1;
+      if(i<sorted.length-1){
+        const d0=new Date(t.date+"T12:00:00");
+        const d1=new Date(sorted[i+1].date+"T12:00:00");
+        calDays=Math.round((d1-d0)/(864e5));
       }else{
-        pos[key].vnNet-=op.vn;
-        pos[key].vnVenta+=op.vn;
+        // Last entry: count to next business day from this date
+        const d0=new Date(t.date+"T12:00:00");
+        const nb=getNextBusinessDay(t.date);
+        const d1=new Date(nb+"T12:00:00");
+        calDays=Math.round((d1-d0)/(864e5));
       }
-      pos[key].montoTotal+=op.monto;
+      map[t.date]={rate:t.rate,calDays};
     }
-    return Object.values(pos).filter(p=>p.vnNet!==0||p.vnCompra>0||p.vnVenta>0).sort((a,b)=>a.ticker.localeCompare(b.ticker));
-  },[operations]);
+    return map;
+  },[tasas]);
+
+  // Get sorted tasa dates for iteration
+  const tasaDates=useMemo(()=>Object.keys(tasaMap).sort(),[tasaMap]);
+
+  // Calculate adjusted cost for one operation
+  // PX_adj = PX × product of (1 + rate_i/100/365 * calDays_i) for each rueda from liqDate to today
+  const calcCarry=(px,liqDate)=>{
+    let cost=px;
+    for(const td of tasaDates){
+      if(td<liqDate)continue;// tasa before liquidation, skip
+      if(td>=today)break;// today or future, stop
+      const t=tasaMap[td];
+      if(!t)continue;
+      const dailyRate=t.rate/100/365;
+      cost=cost*(1+dailyRate*t.calDays);
+    }
+    return cost;
+  };
+
+  // Process all ARS title operations into per-op carry data
+  const arsOpsWithCarry=useMemo(()=>{
+    return operations
+      .filter(op=>(op.currency||"ARS")==="ARS")
+      .map(op=>{
+        // Liquidation date
+        const liqDate=op.plazo==="0"?op.date:getNextBusinessDay(op.date);
+        // Only calculate carry if liquidation is in the past or today
+        const pxOriginal=Math.abs(op.monto)/op.vn*100;// recover PX as percentage of VN
+        const pxAdj=liqDate<=today?calcCarry(pxOriginal,liqDate):pxOriginal;
+        const sign=op.type==="COMPRA"?1:-1;
+        return{
+          ...op,
+          liqDate,
+          pxOriginal,
+          pxAdj,
+          sign,
+          vnSigned:sign*op.vn,
+          costoAdj:pxAdj/100*op.vn*sign,// signed cost in ARS
+        };
+      });
+  },[operations,tasaMap,tasaDates,today]);
+
+  // Group by ticker: VWAP of adjusted cost, VN net
+  const pnlByTicker=useMemo(()=>{
+    const groups={};
+    for(const op of arsOpsWithCarry){
+      const k=op.ticker;
+      if(!groups[k])groups[k]={ticker:k,vnNet:0,costoAdjTotal:0,vnCompra:0,vnVenta:0,ops:[]};
+      groups[k].vnNet+=op.vnSigned;
+      groups[k].costoAdjTotal+=op.costoAdj;
+      if(op.sign>0)groups[k].vnCompra+=op.vn;
+      else groups[k].vnVenta+=op.vn;
+      groups[k].ops.push(op);
+    }
+    // Compute VWAP cost = total adjusted cost / VN net (use absolute for VWAP)
+    return Object.values(groups).map(g=>{
+      const totalVN=g.ops.reduce((s,o)=>s+Math.abs(o.vnSigned),0);
+      const totalCost=g.ops.reduce((s,o)=>s+Math.abs(o.costoAdj),0);
+      const vwapCost=totalVN>0?(totalCost/totalVN*100):0;// as % of VN
+      return{...g,vwapCost};
+    }).sort((a,b)=>a.ticker.localeCompare(b.ticker));
+  },[arsOpsWithCarry]);
+
+  // Fetch BYMA market prices
+  const fetchMarketPrices=async()=>{
+    const tickers=pnlByTicker.map(p=>p.ticker).filter(t=>t);
+    if(tickers.length===0)return;
+    setMktLoading(true);
+    try{
+      const r=await fetch("/api/byma/quotes?symbols="+encodeURIComponent(tickers.join(",")));
+      const data=await r.json();
+      setMktPrices(data.symbols||{});
+    }catch(e){console.warn("PNL market fetch error",e);}
+    setMktLoading(false);
+  };
+
+  useEffect(()=>{if(pnlByTicker.length>0)fetchMarketPrices();},[pnlByTicker.length]);
 
   // FX consolidated
   const fxPos=useMemo(()=>{
@@ -1210,92 +1318,142 @@ function PosicionPNL({operations,fxOps}){
     return cash;
   },[operations]);
 
+  // Non-ARS positions (MEP/CCL) simple view
+  const nonArsPositions=useMemo(()=>{
+    const pos={};
+    for(const op of operations){
+      if((op.currency||"ARS")==="ARS")continue;
+      const key=op.ticker;
+      if(!pos[key])pos[key]={ticker:key,currency:op.currency,vnNet:0,montoTotal:0};
+      pos[key].vnNet+=op.type==="COMPRA"?op.vn:-op.vn;
+      pos[key].montoTotal+=op.monto;
+    }
+    return Object.values(pos).filter(p=>p.vnNet!==0);
+  },[operations]);
+
+  // PNL totals
+  const pnlTotal=useMemo(()=>{
+    let totalPnl=0;
+    for(const p of pnlByTicker){
+      const mkt=mktPrices[p.ticker];
+      if(mkt&&mkt.vwap!=null&&p.vnNet!==0){
+        const valMkt=(mkt.vwap/100)*Math.abs(p.vnNet);
+        const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
+        const pnl=p.vnNet>0?(valMkt-valCost):(valCost-valMkt);
+        totalPnl+=pnl;
+      }
+    }
+    return totalPnl;
+  },[pnlByTicker,mktPrices]);
+
   const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+  const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"—";
 
   return(
     <div>
-      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Posición consolidada global — todas las operaciones acumuladas</div>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Posición consolidada — costo ajustado por fondeo + valuación a VWAP mercado</div>
 
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20,marginBottom:24}}>
-        {/* Cash position from titles + FX */}
-        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)"}}>
-          <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
-            Saldo Cash
-          </div>
-          <div style={{padding:"16px 20px"}}>
-            {[
-              {label:"ARS",val:cashFromTitles.ARS+fxPos.ARS,color:"#63b3ed"},
-              {label:"USD MEP",val:cashFromTitles.MEP+fxPos.MEP,color:"#68d391"},
-              {label:"USD Cable",val:cashFromTitles.CCL+fxPos.Cable,color:"#ed8936"},
-            ].map(r=>(
-              <div key={r.label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
-                <span style={{fontSize:12,fontWeight:600,color:r.color}}>{r.label}</span>
-                <span style={{fontSize:16,fontWeight:700,fontVariantNumeric:"tabular-nums",color:r.val===0?"#4a5568":r.val>0?"#68d391":"#fc8181"}}>
-                  {r.val===0?"0":fmtMoney(r.val)}
-                </span>
-              </div>
-            ))}
-          </div>
+      {/* Summary cards */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16,marginBottom:24}}>
+        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",padding:"16px 20px"}}>
+          <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>Saldo Cash</div>
+          {[
+            {label:"ARS",val:cashFromTitles.ARS+fxPos.ARS,color:"#63b3ed"},
+            {label:"USD MEP",val:cashFromTitles.MEP+fxPos.MEP,color:"#68d391"},
+            {label:"USD Cable",val:cashFromTitles.CCL+fxPos.Cable,color:"#ed8936"},
+          ].map(r=>(
+            <div key={r.label} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
+              <span style={{fontSize:11,color:r.color,fontWeight:600}}>{r.label}</span>
+              <span style={{fontSize:13,fontWeight:700,fontVariantNumeric:"tabular-nums",color:r.val===0?"#4a5568":r.val>0?"#68d391":"#fc8181"}}>{r.val===0?"0":fmtMoney(r.val)}</span>
+            </div>
+          ))}
         </div>
-
-        {/* FX position detail */}
-        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)"}}>
-          <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
-            Posición FX neta
-          </div>
-          <div style={{padding:"16px 20px"}}>
-            {Object.entries(fxPos).map(([k,v])=>(
-              <div key={k} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
-                <span style={{fontSize:12,fontWeight:600,color:"#a0aec0"}}>{k}</span>
-                <span style={{fontSize:16,fontWeight:700,fontVariantNumeric:"tabular-nums",color:v===0?"#4a5568":v>0?"#68d391":"#fc8181"}}>
-                  {v===0?"0":fmtMoney(v)}
-                </span>
-              </div>
-            ))}
-          </div>
+        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",padding:"16px 20px"}}>
+          <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>Posición FX neta</div>
+          {Object.entries(fxPos).map(([k,v])=>(
+            <div key={k} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:"1px solid rgba(99,179,237,0.04)"}}>
+              <span style={{fontSize:11,color:"#a0aec0",fontWeight:600}}>{k}</span>
+              <span style={{fontSize:13,fontWeight:700,fontVariantNumeric:"tabular-nums",color:v===0?"#4a5568":v>0?"#68d391":"#fc8181"}}>{v===0?"0":fmtMoney(v)}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{background:"#111827",borderRadius:12,border:`1px solid ${pnlTotal>=0?"rgba(72,187,120,0.2)":"rgba(252,129,129,0.2)"}`,padding:"16px 20px"}}>
+          <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>PNL Total Títulos ARS</div>
+          <div style={{fontSize:28,fontWeight:800,color:pnlTotal===0?"#4a5568":pnlTotal>0?"#68d391":"#fc8181",fontVariantNumeric:"tabular-nums"}}>{fmtMoney(pnlTotal)}</div>
+          <div style={{fontSize:10,color:"#4a5568",marginTop:4}}>Costo ajustado por fondeo vs VWAP BYMA</div>
         </div>
       </div>
 
-      {/* Titles position table */}
-      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
-        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>
-          Posición en Títulos (VN neto)
+      {/* PNL by ticker - ARS positions */}
+      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden",marginBottom:24}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#f7fafc"}}>PNL Títulos ARS — Costo con Fondeo</div>
+          <button onClick={fetchMarketPrices} disabled={mktLoading} style={{padding:"5px 14px",background:"rgba(237,137,54,0.1)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:6,color:"#ed8936",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{mktLoading?"Cargando...":"↻ Actualizar precios BYMA"}</button>
         </div>
-        {positions.length===0?(
-          <div style={{padding:"30px 20px",textAlign:"center",color:"#4a5568",fontSize:13}}>Sin posiciones abiertas</div>
+        {pnlByTicker.length===0?(
+          <div style={{padding:"30px 20px",textAlign:"center",color:"#4a5568",fontSize:13}}>Sin posiciones ARS</div>
         ):(
           <table style={{width:"100%",borderCollapse:"collapse"}}>
             <thead>
               <tr>
                 <th style={hdS}>Ticker</th>
-                <th style={hdS}>Moneda</th>
-                <th style={{...hdS,textAlign:"right"}}>VN Comprado</th>
-                <th style={{...hdS,textAlign:"right"}}>VN Vendido</th>
                 <th style={{...hdS,textAlign:"right"}}>VN Neto</th>
-                <th style={{...hdS,textAlign:"right"}}>Monto Neto</th>
+                <th style={{...hdS,textAlign:"right"}}>VWAP Costo+Fondeo</th>
+                <th style={{...hdS,textAlign:"right"}}>VWAP Mercado</th>
+                <th style={{...hdS,textAlign:"right"}}>Costo Total</th>
+                <th style={{...hdS,textAlign:"right"}}>Valor Mercado</th>
+                <th style={{...hdS,textAlign:"right"}}>PNL</th>
               </tr>
             </thead>
             <tbody>
-              {positions.map(p=>(
-                <tr key={p.ticker} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+              {pnlByTicker.map(p=>{
+                const mkt=mktPrices[p.ticker];
+                const vwapMkt=mkt?.vwap;
+                const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
+                const valMkt=vwapMkt!=null?(vwapMkt/100)*Math.abs(p.vnNet):null;
+                const pnl=valMkt!=null?(p.vnNet>0?(valMkt-valCost):(valCost-valMkt)):null;
+                return(
+                  <tr key={p.ticker} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                    <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{p.ticker}</td>
+                    <td style={{...cellS,textAlign:"right",fontWeight:700,color:p.vnNet>0?"#68d391":p.vnNet<0?"#fc8181":"#4a5568"}}>{(p.vnNet>0?"+":"")+fmtNum(p.vnNet)}</td>
+                    <td style={{...cellS,textAlign:"right",color:"#f6e05e",fontWeight:600}}>{fmtPx(p.vwapCost)}</td>
+                    <td style={{...cellS,textAlign:"right",color:vwapMkt!=null?"#b794f4":"#4a5568",fontWeight:600}}>{fmtPx(vwapMkt)}{mkt?.error&&<span title={mkt.error} style={{color:"#fc8181",marginLeft:4,cursor:"help",fontSize:10}}>⚠</span>}</td>
+                    <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{fmtMoney(valCost)}</td>
+                    <td style={{...cellS,textAlign:"right",color:valMkt!=null?"#a0aec0":"#4a5568"}}>{valMkt!=null?fmtMoney(valMkt):"—"}</td>
+                    <td style={{...cellS,textAlign:"right",fontWeight:700,fontSize:13,color:pnl==null?"#4a5568":pnl>=0?"#68d391":"#fc8181"}}>{pnl!=null?fmtMoney(pnl):"—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Non-ARS positions (simple) */}
+      {nonArsPositions.length>0&&(
+        <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+          <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",fontSize:14,fontWeight:700,color:"#f7fafc"}}>Posición Títulos MEP/CCL</div>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr>
+              <th style={hdS}>Ticker</th><th style={hdS}>Moneda</th><th style={{...hdS,textAlign:"right"}}>VN Neto</th><th style={{...hdS,textAlign:"right"}}>Monto Neto</th>
+            </tr></thead>
+            <tbody>
+              {nonArsPositions.map(p=>(
+                <tr key={p.ticker} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
                   <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{p.ticker}</td>
-                  <td style={cellS}>
-                    <span style={{fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700,background:p.currency==="ARS"?"rgba(99,179,237,0.1)":p.currency==="MEP"?"rgba(72,187,120,0.1)":"rgba(237,137,54,0.1)",color:p.currency==="ARS"?"#63b3ed":p.currency==="MEP"?"#68d391":"#ed8936"}}>{p.currency}</span>
-                  </td>
-                  <td style={{...cellS,textAlign:"right",color:"#68d391"}}>{p.vnCompra>0?"+"+fmtNum(p.vnCompra):"\u2014"}</td>
-                  <td style={{...cellS,textAlign:"right",color:"#fc8181"}}>{p.vnVenta>0?"-"+fmtNum(p.vnVenta):"\u2014"}</td>
-                  <td style={{...cellS,textAlign:"right",fontWeight:700,fontSize:14,color:p.vnNet>0?"#68d391":p.vnNet<0?"#fc8181":"#4a5568"}}>
-                    {p.vnNet>0?"+":""}{fmtNum(p.vnNet)}
-                  </td>
-                  <td style={{...cellS,textAlign:"right",fontWeight:600,color:p.montoTotal>=0?"#68d391":"#fc8181"}}>
-                    {fmtMoney(p.montoTotal)}
-                  </td>
+                  <td style={cellS}><span style={{fontSize:10,padding:"2px 7px",borderRadius:4,fontWeight:700,background:p.currency==="MEP"?"rgba(72,187,120,0.1)":"rgba(237,137,54,0.1)",color:p.currency==="MEP"?"#68d391":"#ed8936"}}>{p.currency}</span></td>
+                  <td style={{...cellS,textAlign:"right",fontWeight:700,color:p.vnNet>0?"#68d391":"#fc8181"}}>{(p.vnNet>0?"+":"")+fmtNum(p.vnNet)}</td>
+                  <td style={{...cellS,textAlign:"right",fontWeight:600,color:p.montoTotal>=0?"#68d391":"#fc8181"}}>{fmtMoney(p.montoTotal)}</td>
                 </tr>
               ))}
             </tbody>
           </table>
-        )}
+        </div>
+      )}
+
+      <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
+        Nota: VWAP Costo+Fondeo = precio de compra ajustado por tasa de caución diaria (TNA/365 × días calendario) desde liquidación hasta hoy. VWAP Mercado = BYMA Open (delay ~20 min).
       </div>
     </div>
   );
@@ -1601,6 +1759,119 @@ function Mercado(){
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ============================================================
+// TASAS DE FONDEO
+// ============================================================
+function TasasFondeo({tasas,setTasas}){
+  const[newDate,setNewDate]=useState("");
+  const[newRate,setNewRate]=useState("");
+  const[editIdx,setEditIdx]=useState(null);
+  const[editRate,setEditRate]=useState("");
+
+  const sorted=useMemo(()=>[...tasas].sort((a,b)=>b.date.localeCompare(a.date)),[tasas]);
+
+  const addTasa=()=>{
+    if(!newDate||!newRate)return;
+    const rate=parseFloat(newRate.replace(",","."));
+    if(isNaN(rate))return;
+    // Update if date exists, else add
+    const existing=tasas.findIndex(t=>t.date===newDate);
+    if(existing>=0){
+      setTasas(p=>p.map((t,i)=>i===existing?{...t,rate}:t));
+    }else{
+      setTasas(p=>[...p,{date:newDate,rate}]);
+    }
+    setNewDate("");setNewRate("");
+  };
+
+  const removeTasa=(date)=>{
+    if(!window.confirm(`¿Eliminar tasa del ${fmtDD(date)}?`))return;
+    setTasas(p=>p.filter(t=>t.date!==date));
+  };
+
+  const startEdit=(idx,rate)=>{setEditIdx(idx);setEditRate(String(rate).replace(".",","));};
+  const saveEdit=(date)=>{
+    const rate=parseFloat(editRate.replace(",","."));
+    if(isNaN(rate)){setEditIdx(null);return;}
+    setTasas(p=>p.map(t=>t.date===date?{...t,rate}:t));
+    setEditIdx(null);
+  };
+
+  // Stats
+  const avg=tasas.length>0?(tasas.reduce((s,t)=>s+t.rate,0)/tasas.length):0;
+  const latest=sorted.length>0?sorted[0]:null;
+
+  const cellS={padding:"8px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
+  return(
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Registro diario de tasa de fondeo (caución)</div>
+
+      {/* Stats */}
+      <div style={{display:"flex",gap:16,marginBottom:20}}>
+        <div style={{flex:1,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",padding:"16px 20px"}}>
+          <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:4}}>Última tasa</div>
+          <div style={{fontSize:22,fontWeight:700,color:"#f6e05e"}}>{latest?latest.rate.toFixed(2)+"%":"—"}</div>
+          <div style={{fontSize:10,color:"#4a5568",marginTop:2}}>{latest?fmtDD(latest.date):""}</div>
+        </div>
+        <div style={{flex:1,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",padding:"16px 20px"}}>
+          <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:4}}>Promedio</div>
+          <div style={{fontSize:22,fontWeight:700,color:"#63b3ed"}}>{avg.toFixed(2)}%</div>
+          <div style={{fontSize:10,color:"#4a5568",marginTop:2}}>{tasas.length} registro{tasas.length!==1?"s":""}</div>
+        </div>
+      </div>
+
+      {/* Add new */}
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:20,padding:16,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)"}}>
+        <input type="date" value={newDate} onChange={e=>setNewDate(e.target.value)} style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none"}}/>
+        <div style={{display:"flex",alignItems:"center",gap:4}}>
+          <input value={newRate} onChange={e=>setNewRate(e.target.value)} placeholder="Tasa %" style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",width:100,textAlign:"right"}} onKeyDown={e=>e.key==="Enter"&&addTasa()}/>
+          <span style={{fontSize:11,color:"#718096"}}>%</span>
+        </div>
+        <button onClick={addTasa} style={{padding:"8px 20px",background:"#3182ce",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Agregar</button>
+      </div>
+
+      {/* Table */}
+      <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr>
+              <th style={hdS}>Fecha</th>
+              <th style={{...hdS,textAlign:"right"}}>Tasa Fondeo</th>
+              <th style={{...hdS,textAlign:"center",width:80}}>Acciones</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((t,i)=>{
+              const isEditing=editIdx===i;
+              return(
+                <tr key={t.date} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                  <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{fmtDD(t.date)}</td>
+                  <td style={{...cellS,textAlign:"right"}}>
+                    {isEditing?(
+                      <input value={editRate} onChange={e=>setEditRate(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")saveEdit(t.date);if(e.key==="Escape")setEditIdx(null);}} onBlur={()=>saveEdit(t.date)} autoFocus style={{padding:"4px 8px",background:"#1a2332",border:"1px solid #3182ce",borderRadius:4,color:"#f6e05e",fontSize:12,fontFamily:"inherit",outline:"none",width:80,textAlign:"right"}}/>
+                    ):(
+                      <span style={{color:"#f6e05e",fontWeight:600,cursor:"pointer"}} onClick={()=>startEdit(i,t.rate)}>{t.rate.toFixed(2)}%</span>
+                    )}
+                  </td>
+                  <td style={{...cellS,textAlign:"center"}}>
+                    <button onClick={()=>startEdit(i,t.rate)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:12,padding:"2px 6px"}}>✏️</button>
+                    <button onClick={()=>removeTasa(t.date)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:12,padding:"2px 6px"}}>✕</button>
+                  </td>
+                </tr>
+              );
+            })}
+            {sorted.length===0&&(
+              <tr><td colSpan={3} style={{...cellS,textAlign:"center",color:"#4a5568",padding:30}}>No hay tasas registradas</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
