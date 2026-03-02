@@ -1233,27 +1233,6 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos,manualPrices,setManua
     return m;
   },[bonosVencidos]);
 
-  // Fetch market prices based on source
-  // After 17hs AR time: use cached prices, don't refetch BYMA (avoids errors)
-  const fetchMarketPrices=async()=>{
-    const tickers=pnlByTicker.map(p=>p.ticker).filter(t=>t);
-    if(tickers.length===0)return;
-    if(priceSource==="byma"&&isAfterMarketHours()&&Object.keys(mktPrices).length>0)return;// keep cached
-    setMktLoading(true);
-    try{
-      const endpoint=priceSource==="mae"?"/api/mae/quotes":"/api/byma/quotes";
-      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(tickers.join(",")));
-      const data=await r.json();
-      const syms=data.symbols||{};
-      // Only update if we got actual data (not all errors)
-      const hasData=Object.values(syms).some(v=>v.vwap!=null||v.last!=null);
-      if(hasData||Object.keys(mktPrices).length===0)setMktPrices(syms);
-    }catch(e){console.warn("PNL market fetch error",e);}
-    setMktLoading(false);
-  };
-
-  useEffect(()=>{if(pnlByTicker.length>0)fetchMarketPrices();},[pnlByTicker.length,priceSource]);
-
   // Build tasa lookup: date -> {rate, calDays}
   // calDays = calendar days this rate covers (until next business day)
   const tasaMap=useMemo(()=>{
@@ -1340,6 +1319,26 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos,manualPrices,setManua
       return{...g,vwapCost};
     }).sort((a,b)=>a.ticker.localeCompare(b.ticker));
   },[arsOpsWithCarry]);
+
+  // Fetch market prices based on source
+  // After 17hs AR time: use cached prices, don't refetch BYMA (avoids errors)
+  const fetchMarketPrices=async()=>{
+    const tickers=pnlByTicker.map(p=>p.ticker).filter(t=>t);
+    if(tickers.length===0)return;
+    if(priceSource==="byma"&&isAfterMarketHours()&&Object.keys(mktPrices).length>0)return;
+    setMktLoading(true);
+    try{
+      const endpoint=priceSource==="mae"?"/api/mae/quotes":"/api/byma/quotes";
+      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(tickers.join(",")));
+      const data=await r.json();
+      const syms=data.symbols||{};
+      const hasData=Object.values(syms).some(v=>v.vwap!=null||v.last!=null);
+      if(hasData||Object.keys(mktPrices).length===0)setMktPrices(syms);
+    }catch(e){console.warn("PNL market fetch error",e);}
+    setMktLoading(false);
+  };
+
+  useEffect(()=>{if(pnlByTicker.length>0)fetchMarketPrices();},[pnlByTicker.length,priceSource]);
 
   // FX consolidated
   const fxPos=useMemo(()=>{
