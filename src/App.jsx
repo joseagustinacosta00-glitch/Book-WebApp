@@ -145,10 +145,12 @@ export default function App(){
   const[operations,setOperations]=useState(()=>loadS("o1",[]));
   const[fxOps,setFxOps]=useState(()=>loadS("fx1",[]));
   const[tasas,setTasas]=useState(()=>loadS("tasas1",INIT_TASAS));
+  const[bonosVencidos,setBonosVencidos]=useState(()=>loadS("bv1",[]));
   useEffect(()=>{saveS("i1",instruments);},[instruments]);
   useEffect(()=>{saveS("o1",operations);},[operations]);
   useEffect(()=>{saveS("fx1",fxOps);},[fxOps]);
   useEffect(()=>{saveS("tasas1",tasas);},[tasas]);
+  useEffect(()=>{saveS("bv1",bonosVencidos);},[bonosVencidos]);
   const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>{if(f==="Monedas")return;its.forEach(i=>l.push({...i,family:f}));});return l;},[instruments]);
 
   const tabs=[
@@ -159,6 +161,7 @@ export default function App(){
     {id:"posicion",label:"Posición & PNL",icon:"\u{1F4B0}"},
     {id:"mercado",label:"Mercado",icon:"\u{1F4E1}"},
     {id:"tasas",label:"Tasas",icon:"\u{1F4C8}"},
+    {id:"bonosvencidos",label:"Bonos Vencidos",icon:"\u{1F4C5}"},
   ];
 
   return(
@@ -182,9 +185,10 @@ export default function App(){
         {tab==="blotter"&&<Blotter operations={operations} setOperations={setOperations} fxOps={fxOps} setFxOps={setFxOps} allTickers={allTickers}/>}
         {tab==="auditoria"&&<Auditoria operations={operations} fxOps={fxOps}/>}
         {tab==="instrumentos"&&<BaseInstrumentos instruments={instruments} setInstruments={setInstruments}/>}
-        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas}/>}
+        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas} bonosVencidos={bonosVencidos}/>}
         {tab==="mercado"&&<Mercado/>}
         {tab==="tasas"&&<TasasFondeo tasas={tasas} setTasas={setTasas}/>}
+        {tab==="bonosvencidos"&&<BonosVencidos bonosVencidos={bonosVencidos} setBonosVencidos={setBonosVencidos}/>}
       </main>
     </div>
   );
@@ -1190,10 +1194,25 @@ function Auditoria({operations,fxOps}){
 // ============================================================
 // POSICIÓN & PNL — Consolidated position across all dates
 // ============================================================
-function PosicionPNL({operations,fxOps,tasas}){
+function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
   const today=fmtD(new Date());
   const[mktPrices,setMktPrices]=useState({});
   const[mktLoading,setMktLoading]=useState(false);
+  const[manualPrices,setManualPrices]=useState(()=>loadS("manualPx",{}));// ticker -> price
+  const[priceSource,setPriceSource]=useState("byma");// "byma" | "manual"
+  const[editingPx,setEditingPx]=useState(null);// ticker being edited
+  const[editPxVal,setEditPxVal]=useState("");
+
+  useEffect(()=>{saveS("manualPx",manualPrices);},[manualPrices]);
+
+  // Build maturity price lookup: ticker -> {px, date}
+  const maturityMap=useMemo(()=>{
+    const m={};
+    for(const bv of(bonosVencidos||[])){
+      m[bv.ticker.toUpperCase()]={px:bv.pxVto,date:bv.fechaVto};
+    }
+    return m;
+  },[bonosVencidos]);
 
   // Build tasa lookup: date -> {rate, calDays}
   // calDays = calendar days this rate covers (until next business day)
@@ -1331,20 +1350,38 @@ function PosicionPNL({operations,fxOps,tasas}){
     return Object.values(pos).filter(p=>p.vnNet!==0);
   },[operations]);
 
+  // Resolve price for a ticker based on source
+  const getPrice=(ticker)=>{
+    const mat=maturityMap[ticker.toUpperCase()];
+    if(mat)return{px:mat.px,src:"VTO"};
+    if(priceSource==="manual"){
+      const mp=manualPrices[ticker];
+      if(mp!=null)return{px:mp,src:"MANUAL"};
+      return{px:null,src:"—"};
+    }
+    const mkt=mktPrices[ticker];
+    if(mkt?.vwap!=null)return{px:mkt.vwap,src:"BYMA"};
+    if(mkt?.last!=null)return{px:mkt.last,src:"BYMA"};
+    // Fallback to manual if available
+    const mp=manualPrices[ticker];
+    if(mp!=null)return{px:mp,src:"MANUAL"};
+    return{px:null,src:mkt?.error?"ERR":"—"};
+  };
+
   // PNL totals
   const pnlTotal=useMemo(()=>{
     let totalPnl=0;
     for(const p of pnlByTicker){
-      const mkt=mktPrices[p.ticker];
-      if(mkt&&mkt.vwap!=null&&p.vnNet!==0){
-        const valMkt=(mkt.vwap/100)*Math.abs(p.vnNet);
+      const{px}=getPrice(p.ticker);
+      if(px!=null&&p.vnNet!==0){
+        const valMkt=(px/100)*Math.abs(p.vnNet);
         const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
         const pnl=p.vnNet>0?(valMkt-valCost):(valCost-valMkt);
         totalPnl+=pnl;
       }
     }
     return totalPnl;
-  },[pnlByTicker,mktPrices]);
+  },[pnlByTicker,mktPrices,maturityMap,manualPrices,priceSource]);
 
   const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
@@ -1387,9 +1424,14 @@ function PosicionPNL({operations,fxOps,tasas}){
 
       {/* PNL by ticker - ARS positions */}
       <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden",marginBottom:24}}>
-        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div style={{padding:"14px 20px",borderBottom:"1px solid rgba(99,179,237,0.08)",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:10}}>
           <div style={{fontSize:14,fontWeight:700,color:"#f7fafc"}}>PNL Títulos ARS — Costo con Fondeo</div>
-          <button onClick={fetchMarketPrices} disabled={mktLoading} style={{padding:"5px 14px",background:"rgba(237,137,54,0.1)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:6,color:"#ed8936",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{mktLoading?"Cargando...":"↻ Actualizar precios BYMA"}</button>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <span style={{fontSize:10,color:"#718096"}}>Precio:</span>
+            <button onClick={()=>setPriceSource("byma")} style={{padding:"4px 12px",borderRadius:4,border:priceSource==="byma"?"1px solid #ed8936":"1px solid rgba(99,179,237,0.15)",background:priceSource==="byma"?"rgba(237,137,54,0.15)":"transparent",color:priceSource==="byma"?"#ed8936":"#718096",fontSize:10,fontWeight:priceSource==="byma"?700:400,cursor:"pointer",fontFamily:"inherit"}}>BYMA Open</button>
+            <button onClick={()=>setPriceSource("manual")} style={{padding:"4px 12px",borderRadius:4,border:priceSource==="manual"?"1px solid #b794f4":"1px solid rgba(99,179,237,0.15)",background:priceSource==="manual"?"rgba(183,148,244,0.15)":"transparent",color:priceSource==="manual"?"#b794f4":"#718096",fontSize:10,fontWeight:priceSource==="manual"?700:400,cursor:"pointer",fontFamily:"inherit"}}>Manual</button>
+            {priceSource==="byma"&&<button onClick={fetchMarketPrices} disabled={mktLoading} style={{padding:"4px 12px",borderRadius:4,border:"1px solid rgba(237,137,54,0.2)",background:"rgba(237,137,54,0.1)",color:"#ed8936",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{mktLoading?"...":"↻ Refresh"}</button>}
+          </div>
         </div>
         {pnlByTicker.length===0?(
           <div style={{padding:"30px 20px",textAlign:"center",color:"#4a5568",fontSize:13}}>Sin posiciones ARS</div>
@@ -1400,7 +1442,7 @@ function PosicionPNL({operations,fxOps,tasas}){
                 <th style={hdS}>Ticker</th>
                 <th style={{...hdS,textAlign:"right"}}>VN Neto</th>
                 <th style={{...hdS,textAlign:"right"}}>VWAP Costo+Fondeo</th>
-                <th style={{...hdS,textAlign:"right"}}>VWAP Mercado</th>
+                <th style={{...hdS,textAlign:"right"}}>Precio Valuación</th>
                 <th style={{...hdS,textAlign:"right"}}>Costo Total</th>
                 <th style={{...hdS,textAlign:"right"}}>Valor Mercado</th>
                 <th style={{...hdS,textAlign:"right"}}>PNL</th>
@@ -1408,17 +1450,30 @@ function PosicionPNL({operations,fxOps,tasas}){
             </thead>
             <tbody>
               {pnlByTicker.map(p=>{
-                const mkt=mktPrices[p.ticker];
-                const vwapMkt=mkt?.vwap;
+                const{px:vwapMkt,src}=getPrice(p.ticker);
                 const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
                 const valMkt=vwapMkt!=null?(vwapMkt/100)*Math.abs(p.vnNet):null;
                 const pnl=valMkt!=null?(p.vnNet>0?(valMkt-valCost):(valCost-valMkt)):null;
+                const isEditingThis=editingPx===p.ticker;
+                const srcColor=src==="VTO"?"#ed8936":src==="MANUAL"?"#b794f4":src==="BYMA"?"#68d391":"#4a5568";
                 return(
                   <tr key={p.ticker} style={{transition:"background 0.15s"}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                    <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{p.ticker}</td>
+                    <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{p.ticker}{src==="VTO"&&<span style={{fontSize:9,color:"#ed8936",marginLeft:4}}>VTO</span>}</td>
                     <td style={{...cellS,textAlign:"right",fontWeight:700,color:p.vnNet>0?"#68d391":p.vnNet<0?"#fc8181":"#4a5568"}}>{(p.vnNet>0?"+":"")+fmtNum(p.vnNet)}</td>
                     <td style={{...cellS,textAlign:"right",color:"#f6e05e",fontWeight:600}}>{fmtPx(p.vwapCost)}</td>
-                    <td style={{...cellS,textAlign:"right",color:vwapMkt!=null?"#b794f4":"#4a5568",fontWeight:600}}>{fmtPx(vwapMkt)}{mkt?.error&&<span title={mkt.error} style={{color:"#fc8181",marginLeft:4,cursor:"help",fontSize:10}}>⚠</span>}</td>
+                    <td style={{...cellS,textAlign:"right"}}>
+                      {isEditingThis?(
+                        <input value={editPxVal} onChange={e=>setEditPxVal(e.target.value)} onKeyDown={e=>{
+                          if(e.key==="Enter"){const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){setManualPrices(prev=>({...prev,[p.ticker]:v}));}setEditingPx(null);}
+                          if(e.key==="Escape")setEditingPx(null);
+                        }} onBlur={()=>{const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){setManualPrices(prev=>({...prev,[p.ticker]:v}));}setEditingPx(null);}}
+                        autoFocus style={{padding:"3px 6px",background:"#1a2332",border:"1px solid #b794f4",borderRadius:4,color:"#b794f4",fontSize:12,fontFamily:"inherit",outline:"none",width:70,textAlign:"right"}}/>
+                      ):(
+                        <span style={{cursor:"pointer",color:vwapMkt!=null?srcColor:"#4a5568",fontWeight:600}} onClick={()=>{setEditingPx(p.ticker);setEditPxVal(vwapMkt!=null?String(vwapMkt):"");}}>
+                          {fmtPx(vwapMkt)}<span style={{fontSize:8,color:srcColor,marginLeft:3}}>{src}</span>
+                        </span>
+                      )}
+                    </td>
                     <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{fmtMoney(valCost)}</td>
                     <td style={{...cellS,textAlign:"right",color:valMkt!=null?"#a0aec0":"#4a5568"}}>{valMkt!=null?fmtMoney(valMkt):"—"}</td>
                     <td style={{...cellS,textAlign:"right",fontWeight:700,fontSize:13,color:pnl==null?"#4a5568":pnl>=0?"#68d391":"#fc8181"}}>{pnl!=null?fmtMoney(pnl):"—"}</td>
@@ -1464,37 +1519,9 @@ function PosicionPNL({operations,fxOps,tasas}){
 // ============================================================
 import { curves } from "./config/curves.js";
 
-const INTERVALS=[
-  {label:"1 min",ms:60000},
-  {label:"5 min",ms:300000},
-  {label:"10 min",ms:600000},
-  {label:"30 min",ms:1800000},
-  {label:"1 hora",ms:3600000},
-];
-
-function getArgentinaTime(){
-  // Argentina is UTC-3 always (no DST)
-  const now=new Date();
-  const utc=now.getTime()+now.getTimezoneOffset()*60000;
-  return new Date(utc-3*3600000);
-}
-
-function isMarketOpen(){
-  const ar=getArgentinaTime();
-  const day=ar.getDay();
-  if(day===0||day===6)return false;// weekend
-  const h=ar.getHours();
-  const m=ar.getMinutes();
-  const mins=h*60+m;
-  // 10:30 to 16:59 AR
-  return mins>=630&&mins<1020;
-}
-
 function fmtARTime(d){
   if(!d)return"";
-  const ar=new Date(d.getTime());
-  // We show the local time as-is since we want to show "when we fetched"
-  return ar.toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
+  return d.toLocaleTimeString("es-AR",{hour:"2-digit",minute:"2-digit",second:"2-digit"});
 }
 
 function Mercado(){
@@ -1504,17 +1531,11 @@ function Mercado(){
   const[quotes,setQuotes]=useState({});
   const[status,setStatus]=useState("idle");
   const[errorMsg,setErrorMsg]=useState("");
-  const[intervalIdx,setIntervalIdx]=useState(1);
   const[lastUpdate,setLastUpdate]=useState(null);
-  const[mktOpen,setMktOpen]=useState(isMarketOpen());
-  const[source,setSource]=useState("rofex");
   const[cauciones,setCauciones]=useState(null);
   const[caucionLoading,setCaucionLoading]=useState(false);
-  const timerRef=useRef(null);
-  const mktCheckRef=useRef(null);
 
   const isTasa=activeCurve==="tasa";
-  const isByma=source==="byma";
 
   const fetchQuotes=async()=>{
     if(isTasa){fetchCauciones();return;}
@@ -1522,8 +1543,7 @@ function Mercado(){
     if(!syms)return;
     setStatus("loading");setErrorMsg("");
     try{
-      const endpoint=isByma?"/api/byma/quotes":"/api/quotes";
-      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(syms));
+      const r=await fetch("/api/byma/quotes?symbols="+encodeURIComponent(syms));
       const data=await r.json();
       const symsData=data.symbols||{};
       setQuotes(symsData);setLastUpdate(new Date());
@@ -1546,103 +1566,45 @@ function Mercado(){
     setCaucionLoading(false);
   };
 
-  useEffect(()=>{
-    const check=()=>setMktOpen(isMarketOpen());
-    check();mktCheckRef.current=setInterval(check,30000);
-    return()=>clearInterval(mktCheckRef.current);
-  },[]);
-
-  useEffect(()=>{
-    fetchQuotes();
-    clearInterval(timerRef.current);
-    if(!isTasa&&!isByma){
-      const ms=INTERVALS[intervalIdx].ms;
-      timerRef.current=setInterval(fetchQuotes,ms);
-    }
-    return()=>clearInterval(timerRef.current);
-  },[activeCurve,intervalIdx,source]);
+  useEffect(()=>{fetchQuotes();},[activeCurve]);
 
   const statusColor=status==="ok"?"#48bb78":status==="error"?"#fc8181":status==="loading"?"#f6e05e":"#a0aec0";
   const cellS={padding:"8px 12px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
-  const btnS=(active)=>({padding:"6px 14px",borderRadius:4,border:active?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:active?"rgba(49,130,206,0.15)":"transparent",color:active?"#63b3ed":"#718096",fontSize:10,fontWeight:active?600:400,cursor:"pointer",fontFamily:"inherit"});
-  const srcBtnS=(active,color)=>({padding:"6px 14px",borderRadius:4,border:active?`1px solid ${color}`:"1px solid rgba(99,179,237,0.15)",background:active?`${color}22`:"transparent",color:active?color:"#718096",fontSize:10,fontWeight:active?700:400,cursor:"pointer",fontFamily:"inherit"});
   const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"\u2014";
   const fmtRate=(v)=>v!=null?Number(v).toFixed(2)+"%":"\u2014";
 
   return(
     <div style={{maxWidth:1100,margin:"0 auto"}}>
       {/* BYMA delay banner */}
-      {isByma&&!isTasa&&(
+      {!isTasa&&(
         <div style={{marginBottom:16,padding:"10px 20px",background:"rgba(237,137,54,0.08)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
           <span style={{fontSize:16}}>⏱️</span>
           <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>BYMA Open — Datos con delay ~20 min</div>
         </div>
       )}
 
-      {/* Market status banner (ROFEX only) */}
-      {!mktOpen&&!isByma&&!isTasa&&(
-        <div style={{marginBottom:16,padding:"12px 20px",background:"rgba(246,224,94,0.08)",border:"1px solid rgba(246,224,94,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:18}}>🔒</span>
-          <div>
-            <div style={{fontSize:13,fontWeight:600,color:"#f6e05e"}}>Mercado cerrado</div>
-            <div style={{fontSize:11,color:"#a0aec0"}}>Horario BYMA: 10:30 a 17:00 hs (Argentina)</div>
-          </div>
-        </div>
-      )}
-
-      {/* Source toggle + Curve tabs */}
-      <div style={{display:"flex",gap:16,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
-        {!isTasa&&(
-          <div style={{display:"flex",gap:4,alignItems:"center",padding:"4px 6px",background:"rgba(99,179,237,0.04)",borderRadius:6,border:"1px solid rgba(99,179,237,0.08)"}}>
-            <span style={{fontSize:10,color:"#718096",marginRight:4}}>Fuente:</span>
-            <button onClick={()=>setSource("rofex")} style={srcBtnS(source==="rofex","#63b3ed")}>ROFEX</button>
-            <button onClick={()=>setSource("byma")} style={srcBtnS(source==="byma","#ed8936")}>BYMA Open</button>
-          </div>
-        )}
-        <div style={{display:"flex",gap:4}}>
-          {curveKeys.map(k=>(
-            <button key={k} onClick={()=>setActiveCurve(k)}
-              style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
-              {curveLabels[k]}
-            </button>
-          ))}
-        </div>
+      {/* Curve tabs */}
+      <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>
+        {curveKeys.map(k=>(
+          <button key={k} onClick={()=>setActiveCurve(k)}
+            style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
+            {curveLabels[k]}
+          </button>
+        ))}
       </div>
 
-      {/* Controls bar (only for ROFEX, not BYMA, not Tasa) */}
-      {!isByma&&!isTasa&&(
-        <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-          <div style={{display:"flex",alignItems:"center",gap:6}}>
-            <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
-            <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
-              {status==="ok"?(mktOpen?"LIVE":"OK"):status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
-            </span>
-          </div>
-          <div style={{display:"flex",alignItems:"center",gap:4}}>
-            <span style={{fontSize:10,color:"#718096",marginRight:4}}>Actualizar cada:</span>
-            {INTERVALS.map((iv,i)=>(
-              <button key={i} onClick={()=>setIntervalIdx(i)} style={btnS(i===intervalIdx)}>{iv.label}</button>
-            ))}
-          </div>
-          <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
-          {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
+      {/* Controls */}
+      <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
+          <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
+            {status==="ok"?"OK":status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
+          </span>
         </div>
-      )}
-
-      {/* BYMA/Tasa minimal controls */}
-      {(isByma||isTasa)&&(
-        <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
-          <div style={{display:"flex",alignItems:"center",gap:6}}>
-            <div style={{width:8,height:8,borderRadius:99,background:statusColor,boxShadow:`0 0 6px ${statusColor}`}}/>
-            <span style={{fontSize:11,fontWeight:600,color:statusColor}}>
-              {status==="ok"?"DELAYED":status==="error"?"ERROR":status==="loading"?"...":"IDLE"}
-            </span>
-          </div>
-          <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
-          {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
-        </div>
-      )}
+        <button onClick={fetchQuotes} style={{padding:"6px 16px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>↻ Refresh</button>
+        {lastUpdate&&<span style={{fontSize:10,color:"#4a5568"}}>Última actualización: {fmtARTime(lastUpdate)}</span>}
+      </div>
 
       {/* Error detail */}
       {status==="error"&&errorMsg&&(
@@ -1737,16 +1699,15 @@ function Mercado(){
                   const hasError=!!q.error;
                   const spread=(q.bid!=null&&q.offer!=null)?(q.offer-q.bid).toFixed(2):"\u2014";
                   return(
-                    <tr key={s.display} style={{transition:"background 0.15s",opacity:hasError?0.5:1}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} title={hasError?q.error:(q.resolved_ticker||"")}>
+                    <tr key={s.display} style={{transition:"background 0.15s",opacity:hasError?0.5:1}} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"} title={hasError?q.error:""}>
                       <td style={{...cellS,fontWeight:600,color:"#f7fafc"}}>{s.display}</td>
                       <td style={{...cellS,textAlign:"right",color:q.last!=null?"#f6e05e":"#4a5568"}}>{fmtPx(q.last)}</td>
                       <td style={{...cellS,textAlign:"right",color:q.bid!=null?"#48bb78":"#4a5568"}}>{fmtPx(q.bid)}</td>
                       <td style={{...cellS,textAlign:"right",color:q.offer!=null?"#fc8181":"#4a5568"}}>{fmtPx(q.offer)}</td>
                       <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{spread}</td>
                       <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_vn!=null?fmtNum(Math.round(q.vol_vn)):"\u2014"}</td>
-                      <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):(q.effective_volume!=null?fmtNum(Math.round(q.effective_volume)):"\u2014")}</td>
-                      {isByma&&<td style={{...cellS,textAlign:"right",color:q.vwap!=null?"#b794f4":"#4a5568",fontWeight:q.vwap!=null?600:400}}>{fmtPx(q.vwap)}</td>}
-                      {!isByma&&<td style={{...cellS,textAlign:"right",color:"#4a5568"}}>—</td>}
+                      <td style={{...cellS,textAlign:"right",color:"#a0aec0"}}>{q.vol_amount!=null?fmtNum(Math.round(q.vol_amount)):"\u2014"}</td>
+                      <td style={{...cellS,textAlign:"right",color:q.vwap!=null?"#b794f4":"#4a5568",fontWeight:q.vwap!=null?600:400}}>{fmtPx(q.vwap)}</td>
                       <td style={{...cellS,textAlign:"center"}}>{hasError?<span title={q.error} style={{color:"#fc8181",cursor:"help"}}>⚠</span>:q.last!=null?<span style={{color:"#48bb78"}}>✓</span>:<span style={{color:"#4a5568"}}>—</span>}</td>
                     </tr>
                   );
@@ -1755,7 +1716,7 @@ function Mercado(){
             </table>
           </div>
           <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
-            Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/health</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{isByma?"/api/byma/raw?symbol=AL30":"/api/debug/AL30"}</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>{isByma?"/api/byma/bonds?q=AL30":"/api/instruments?q=AL30"}</code>
+            Debug: <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/byma/raw?symbol=AL30</code> · <code style={{background:"#1a2332",padding:"2px 6px",borderRadius:3}}>/api/byma/bonds?q=AL30</code>
           </div>
         </div>
       )}
@@ -1871,6 +1832,109 @@ function TasasFondeo({tasas,setTasas}){
             )}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// BONOS VENCIDOS
+// ============================================================
+function BonosVencidos({bonosVencidos,setBonosVencidos}){
+  const[newTicker,setNewTicker]=useState("");
+  const[newFecha,setNewFecha]=useState("");
+  const[newPx,setNewPx]=useState("");
+  const[editIdx,setEditIdx]=useState(null);
+  const[editPx,setEditPx]=useState("");
+
+  const sorted=useMemo(()=>[...bonosVencidos].sort((a,b)=>b.fechaVto.localeCompare(a.fechaVto)),[bonosVencidos]);
+
+  const addBono=()=>{
+    if(!newTicker.trim()||!newFecha||!newPx)return;
+    const px=parseFloat(newPx.replace(",","."));
+    if(isNaN(px))return;
+    const ticker=newTicker.trim().toUpperCase();
+    // Update if ticker exists
+    const existing=bonosVencidos.findIndex(b=>b.ticker.toUpperCase()===ticker);
+    if(existing>=0){
+      setBonosVencidos(p=>p.map((b,i)=>i===existing?{...b,fechaVto:newFecha,pxVto:px}:b));
+    }else{
+      setBonosVencidos(p=>[...p,{ticker,fechaVto:newFecha,pxVto:px}]);
+    }
+    setNewTicker("");setNewFecha("");setNewPx("");
+  };
+
+  const removeBono=(ticker)=>{
+    if(!window.confirm(`¿Eliminar ${ticker}?`))return;
+    setBonosVencidos(p=>p.filter(b=>b.ticker!==ticker));
+  };
+
+  const startEdit=(idx,px)=>{setEditIdx(idx);setEditPx(String(px).replace(".",","));};
+  const saveEdit=(ticker)=>{
+    const px=parseFloat(editPx.replace(",","."));
+    if(isNaN(px)){setEditIdx(null);return;}
+    setBonosVencidos(p=>p.map(b=>b.ticker===ticker?{...b,pxVto:px}:b));
+    setEditIdx(null);
+  };
+
+  const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
+  return(
+    <div style={{maxWidth:700,margin:"0 auto"}}>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Registro de bonos que vencieron — precio de vencimiento para PNL</div>
+
+      {/* Add new */}
+      <div style={{display:"flex",gap:8,alignItems:"center",marginBottom:20,padding:16,background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",flexWrap:"wrap"}}>
+        <input value={newTicker} onChange={e=>setNewTicker(e.target.value)} placeholder="Ticker (ej: AL29)" style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",width:120,textTransform:"uppercase"}}/>
+        <input type="date" value={newFecha} onChange={e=>setNewFecha(e.target.value)} style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none"}}/>
+        <div style={{display:"flex",alignItems:"center",gap:4}}>
+          <input value={newPx} onChange={e=>setNewPx(e.target.value)} placeholder="Precio vto" style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",width:120,textAlign:"right"}} onKeyDown={e=>e.key==="Enter"&&addBono()}/>
+          <span style={{fontSize:11,color:"#718096"}}>%VN</span>
+        </div>
+        <button onClick={addBono} style={{padding:"8px 20px",background:"#3182ce",border:"none",borderRadius:6,color:"#fff",fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Agregar</button>
+      </div>
+
+      {/* Table */}
+      <div style={{background:"#111827",borderRadius:10,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr>
+              <th style={hdS}>Ticker</th>
+              <th style={hdS}>Fecha Vencimiento</th>
+              <th style={{...hdS,textAlign:"right"}}>Precio Vto (%VN)</th>
+              <th style={{...hdS,textAlign:"center",width:80}}>Acciones</th>
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.map((bv,i)=>{
+              const isEditing=editIdx===i;
+              return(
+                <tr key={bv.ticker} onMouseEnter={e=>e.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                  <td style={{...cellS,fontWeight:700,color:"#f7fafc"}}>{bv.ticker}</td>
+                  <td style={{...cellS,color:"#a0aec0"}}>{fmtDD(bv.fechaVto)}</td>
+                  <td style={{...cellS,textAlign:"right"}}>
+                    {isEditing?(
+                      <input value={editPx} onChange={e=>setEditPx(e.target.value)} onKeyDown={e=>{if(e.key==="Enter")saveEdit(bv.ticker);if(e.key==="Escape")setEditIdx(null);}} onBlur={()=>saveEdit(bv.ticker)} autoFocus style={{padding:"4px 8px",background:"#1a2332",border:"1px solid #3182ce",borderRadius:4,color:"#f6e05e",fontSize:12,fontFamily:"inherit",outline:"none",width:80,textAlign:"right"}}/>
+                    ):(
+                      <span style={{color:"#f6e05e",fontWeight:600,cursor:"pointer"}} onClick={()=>startEdit(i,bv.pxVto)}>{bv.pxVto.toFixed(2)}</span>
+                    )}
+                  </td>
+                  <td style={{...cellS,textAlign:"center"}}>
+                    <button onClick={()=>startEdit(i,bv.pxVto)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:12,padding:"2px 6px"}}>✏️</button>
+                    <button onClick={()=>removeBono(bv.ticker)} style={{background:"none",border:"none",color:"#718096",cursor:"pointer",fontSize:12,padding:"2px 6px"}}>✕</button>
+                  </td>
+                </tr>
+              );
+            })}
+            {sorted.length===0&&(
+              <tr><td colSpan={4} style={{...cellS,textAlign:"center",color:"#4a5568",padding:30}}>No hay bonos vencidos registrados</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div style={{marginTop:16,fontSize:10,color:"#4a5568"}}>
+        Los bonos vencidos se usan en Posición & PNL para valuar posiciones de tickers que ya no cotizan. El precio se expresa como % del valor nominal.
       </div>
     </div>
   );

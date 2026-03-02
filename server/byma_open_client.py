@@ -1,6 +1,7 @@
 """
-byma_open_client.py – Open BYMA Data client via PyOBD.
+byma_open_client.py – Open BYMA Data client (direct HTTP).
 Provides delayed (~20 min) market data without credentials.
+Does NOT depend on PyOBD for bonds (avoids tradeHour bug).
 
 Env vars:
   BYMA_TTL_SECONDS  – cache TTL in seconds (default 60)
@@ -13,33 +14,14 @@ import traceback
 # ── State ────────────────────────────────────────────────────
 _cache = {}        # key -> {"data": ..., "ts": float}
 _ttl = None
-_pyobd_available = False
-_obd = None
-_init_error = None
 _sample_keys = None  # stored on first fetch for debugging
 
 
 def _get_ttl():
     global _ttl
     if _ttl is None:
-        _ttl = int(os.environ.get("BYMA_TTL_SECONDS", "60"))
+        _ttl = int(os.environ.get("BYMA_TTL_SECONDS", "120"))
     return _ttl
-
-
-def _init_pyobd():
-    global _pyobd_available, _obd, _init_error
-    if _obd is not None:
-        return True
-    try:
-        from PyOBD import openBYMAdata
-        _obd = openBYMAdata()
-        _pyobd_available = True
-        print("✓ PyOBD initialized")
-        return True
-    except Exception as e:
-        _init_error = f"PyOBD init failed: {e}"
-        print(f"✗ {_init_error}")
-        return False
 
 
 # ── Cache helpers ────────────────────────────────────────────
@@ -55,84 +37,100 @@ def _cache_set(key, data):
     _cache[key] = {"data": data, "ts": time.time()}
 
 
-# ── Market hours check ───────────────────────────────────────
-# Argentine holidays 2026 (BYMA closed)
-_AR_HOLIDAYS_2026 = {
-    "2026-01-01","2026-02-16","2026-02-17","2026-03-23","2026-03-24",
-    "2026-04-02","2026-04-03","2026-05-01","2026-05-25","2026-06-15",
-    "2026-07-09","2026-07-10","2026-08-17","2026-10-12","2026-11-06",
-    "2026-11-23","2026-12-07","2026-12-08","2026-12-24","2026-12-25",
-    "2026-12-31",
-}
+# ── Core: fetch bonds via direct HTTP ────────────────────────
+_BONDS_URLS = [
+    "https://open.bymadata.com.ar/vanep/Api/v1/Bonos",
+    "https://open.bymadata.com.ar/vanep/Api/v1/bonos",
+    "https://open.bymadata.com.ar/vanep/Api/v1/Titulos/Bonos",
+]
 
-def _is_market_hours():
-    """Check if we're within Argentine business hours (10:45-17:00 Mon-Fri, not holiday)."""
-    from datetime import datetime, timezone, timedelta
-    # Argentina is UTC-3, no DST
-    now_utc = datetime.now(timezone.utc)
-    ar_time = now_utc + timedelta(hours=-3)
-    # Weekend?
-    if ar_time.weekday() >= 5:  # 5=Sat, 6=Sun
-        return False
-    # Holiday?
-    date_str = ar_time.strftime("%Y-%m-%d")
-    if date_str in _AR_HOLIDAYS_2026:
-        return False
-    # Time check: 10:45 to 17:00
-    minutes = ar_time.hour * 60 + ar_time.minute
-    return 645 <= minutes <= 1020  # 10:45=645, 17:00=1020
-
-
-# ── Core: fetch bonds ───────────────────────────────────────
 def _fetch_bonds_raw():
-    """Fetch all bonds from PyOBD. Returns list of dicts (raw rows).
-    Only fetches during Argentine market hours to avoid errors."""
+    """Fetch all bonds from Open BYMA API (direct HTTP, no PyOBD).
+    Always attempts fetch; returns stale cache on error."""
     global _sample_keys
 
     cached = _cache_get("bonds_raw")
     if cached is not None:
         return cached
 
-    # Outside market hours: return last known data or empty
-    if not _is_market_hours():
-        # Check if we have ANY cached data (even expired)
-        if "bonds_raw" in _cache:
-            return _cache["bonds_raw"]["data"]
-        raise RuntimeError("Mercado cerrado — fuera de horario hábil argentino (10:45-17:00 L-V)")
+    import requests
 
-    if not _init_pyobd():
-        raise RuntimeError(_init_error or "PyOBD not available")
-
-    try:
-        result = _obd.get_bonds()
-    except Exception as e:
-        # On error, return stale cache if available
-        if "bonds_raw" in _cache:
-            print(f"  PyOBD get_bonds() error, using stale cache: {e}")
-            return _cache["bonds_raw"]["data"]
-        raise RuntimeError(f"PyOBD get_bonds() failed: {e}")
-
-    # result could be a DataFrame or list of dicts
     rows = []
-    if hasattr(result, "to_dict"):
-        # It's a pandas DataFrame
-        rows = result.to_dict("records")
-    elif isinstance(result, list):
-        rows = result
-    elif isinstance(result, dict):
-        rows = [result]
-    else:
-        raise RuntimeError(f"Unexpected PyOBD result type: {type(result)}")
+    last_error = None
 
-    # Log sample keys on first fetch
-    if rows and _sample_keys is None:
-        _sample_keys = list(rows[0].keys())
-        print(f"  PyOBD bonds sample keys: {_sample_keys}")
-        print(f"  PyOBD bonds sample row: {rows[0]}")
-        print(f"  PyOBD bonds total rows: {len(rows)}")
+    for url in _BONDS_URLS:
+        try:
+            r = requests.get(url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; FinOps/1.0)",
+                "Accept": "application/json",
+            })
+            if r.status_code == 200:
+                data = r.json()
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict) and "data" in data:
+                    rows = data["data"] if isinstance(data["data"], list) else []
+                elif isinstance(data, dict) and "Content" in data:
+                    rows = data["Content"] if isinstance(data["Content"], list) else []
+                else:
+                    # Maybe single-level dict with values as list
+                    for v in data.values():
+                        if isinstance(v, list) and len(v) > 0:
+                            rows = v
+                            break
+                    if not rows:
+                        rows = [data] if data else []
 
-    _cache_set("bonds_raw", rows)
-    return rows
+                if rows:
+                    if _sample_keys is None:
+                        _sample_keys = list(rows[0].keys())
+                        print(f"  Bonds sample keys: {_sample_keys}")
+                        print(f"  Bonds sample row: {rows[0]}")
+                        print(f"  Bonds total rows: {len(rows)}")
+                    _cache_set("bonds_raw", rows)
+                    return rows
+            else:
+                last_error = f"HTTP {r.status_code} from {url}"
+        except Exception as e:
+            last_error = f"{url}: {e}"
+
+    # If direct HTTP fails, try PyOBD as fallback
+    try:
+        rows = _fetch_bonds_pyobd()
+        if rows:
+            _cache_set("bonds_raw", rows)
+            return rows
+    except Exception as e:
+        last_error = f"PyOBD fallback also failed: {e}"
+
+    # All failed: return stale cache if any
+    if "bonds_raw" in _cache:
+        print(f"  Bonds fetch failed, using stale cache: {last_error}")
+        return _cache["bonds_raw"]["data"]
+
+    print(f"✗ Bonds fetch failed: {last_error}")
+    return []
+
+
+def _fetch_bonds_pyobd():
+    """Fallback: try PyOBD get_bonds()."""
+    global _sample_keys
+    try:
+        from PyOBD import openBYMAdata
+        obd = openBYMAdata()
+        result = obd.get_bonds()
+        rows = []
+        if hasattr(result, "to_dict"):
+            rows = result.to_dict("records")
+        elif isinstance(result, list):
+            rows = result
+        if rows and _sample_keys is None:
+            _sample_keys = list(rows[0].keys())
+            print(f"  PyOBD bonds sample keys: {_sample_keys}")
+        return rows
+    except Exception as e:
+        print(f"  PyOBD fallback error: {e}")
+        return []
 
 
 # ── Defensive field mapping ──────────────────────────────────
@@ -281,9 +279,8 @@ def health() -> dict:
     """Return health/status info."""
     cached_bonds = _cache.get("bonds_raw")
     return {
-        "ok": _pyobd_available or _obd is not None,
-        "pyobd_available": _pyobd_available,
-        "init_error": _init_error,
+        "ok": cached_bonds is not None and len(cached_bonds.get("data", [])) > 0,
+        "mode": "direct_http",
         "cache_entries": len(_cache),
         "bonds_cached": cached_bonds is not None,
         "bonds_cached_rows": len(cached_bonds["data"]) if cached_bonds else 0,
@@ -316,18 +313,12 @@ _caucion_sample_keys = None
 def get_cauciones() -> list:
     """Fetch cauciones from Open BYMA Data (direct HTTP).
     Returns list of dicts with parsed fields. Cached with TTL.
-    Only fetches during market hours."""
+    Always attempts fetch; returns stale cache on error."""
     global _caucion_sample_keys
 
     cached = _cache_get("cauciones_raw")
     if cached is not None:
         return cached
-
-    # Outside market hours: return stale cache or empty
-    if not _is_market_hours():
-        if "cauciones_raw" in _cache:
-            return _cache["cauciones_raw"]["data"]
-        return []
 
     import requests
 

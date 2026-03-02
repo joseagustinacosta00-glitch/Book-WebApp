@@ -14,87 +14,21 @@ from fastapi.responses import FileResponse
 
 load_dotenv()
 
-from rofex_client import (
-    initialize, ensure_initialized, get_quotes, get_raw_quote,
-    get_instrument_list, _instrument_map, _env_label, _rest_url, _ws_url
-)
-
 app = FastAPI(title="FinOps Registry API", version="1.0.0")
 
 
 @app.on_event("startup")
 def startup():
-    try:
-        initialize()
-    except Exception as e:
-        print(f"✗ Startup init failed (will retry on first request): {e}")
-
-
-# ── API Endpoints ────────────────────────────────────────────
-
-@app.get("/api/health")
-def health():
-    ok, err = ensure_initialized()
-    return {
-        "ok": ok,
-        "env": _env_label,
-        "rest_url": _rest_url or "(pyRofex default)",
-        "ws_url": _ws_url or "(pyRofex default)",
-        "instruments_loaded": len(_instrument_map),
-        "error": err,
-        "has_credentials": all([
-            os.environ.get("ROFEX_USER"),
-            os.environ.get("ROFEX_PASSWORD"),
-            os.environ.get("ROFEX_ACCOUNT"),
-        ]),
-    }
-
-
-@app.get("/api/quotes")
-def quotes(symbols: str = Query(..., description="Comma-separated tickers")):
-    """Always returns 200. Per-symbol errors in each symbol's 'error' field."""
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    if not symbol_list:
-        return {"asof": datetime.now(timezone.utc).isoformat(), "symbols": {}}
-    if len(symbol_list) > 50:
-        symbol_list = symbol_list[:50]
-
-    try:
-        data = get_quotes(symbol_list)
-    except Exception as e:
-        data = {s: {"error": str(e)} for s in symbol_list}
-
-    return {
-        "asof": datetime.now(timezone.utc).isoformat(),
-        "symbols": data,
-    }
-
-
-@app.get("/api/debug/{symbol}")
-def debug_symbol(symbol: str):
-    """Raw pyRofex response + env info for a single symbol."""
-    return get_raw_quote(symbol.upper())
-
-
-@app.get("/api/instruments")
-def instruments(q: str = Query("", description="Filter text")):
-    """List discovered instruments, optionally filtered."""
-    return {
-        "total_mapped": len(_instrument_map),
-        "instruments": get_instrument_list(q),
-    }
-
-
-@app.get("/api/entries")
-def list_entries():
-    import pyRofex
-    members = [m for m in dir(pyRofex.MarketDataEntry) if not m.startswith("_")]
-    return {"entries": members}
+    print("✓ FinOps Registry API starting (BYMA Open only)")
 
 
 # ── BYMA Open Data Endpoints ────────────────────────────────
 
 import byma_open_client as byma
+
+@app.get("/api/health")
+def api_health():
+    return byma.health()
 
 @app.get("/api/byma/health")
 def byma_health():
