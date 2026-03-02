@@ -19,7 +19,13 @@ app = FastAPI(title="FinOps Registry API", version="1.0.0")
 
 @app.on_event("startup")
 def startup():
-    print("✓ FinOps Registry API starting (BYMA Open only)")
+    print("✓ FinOps Registry API starting")
+    # Run MAE endpoint discovery in background
+    try:
+        import mae_client as mae
+        mae.discover_endpoints()
+    except Exception as e:
+        print(f"  MAE discovery error (non-fatal): {e}")
 
 
 # ── BYMA Open Data Endpoints ────────────────────────────────
@@ -28,7 +34,13 @@ import byma_open_client as byma
 
 @app.get("/api/health")
 def api_health():
-    return byma.health()
+    byma_h = byma.health()
+    try:
+        import mae_client as mae
+        mae_h = mae.health()
+    except:
+        mae_h = {"ok": False, "error": "mae_client not available"}
+    return {"byma": byma_h, "mae": mae_h}
 
 @app.get("/api/byma/health")
 def byma_health():
@@ -83,6 +95,44 @@ def byma_cauciones(max_days: int = Query(7)):
 def byma_cauciones_raw():
     """Raw cauciones data for debugging field names."""
     return byma.raw_caucion()
+
+
+# ── MAE Market Data Endpoints ────────────────────────────────
+
+import mae_client as mae
+
+@app.get("/api/mae/health")
+def mae_health():
+    return mae.health()
+
+
+@app.get("/api/mae/discovery")
+def mae_discovery():
+    """Full endpoint discovery results for debugging."""
+    return mae.discovery_results()
+
+
+@app.get("/api/mae/quotes")
+def mae_quotes(symbols: str = Query(..., description="Comma-separated tickers")):
+    """Get quotes from MAE API."""
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        return {"asof": datetime.now(timezone.utc).isoformat(), "source": "MAE", "symbols": {}}
+    try:
+        data = mae.quotes_for(symbol_list)
+    except Exception as e:
+        data = {s: {"error": str(e)} for s in symbol_list}
+    return {
+        "asof": datetime.now(timezone.utc).isoformat(),
+        "source": "MAE",
+        "symbols": data,
+    }
+
+
+@app.get("/api/mae/raw")
+def mae_raw():
+    """Raw MAE bond data for debugging."""
+    return mae.raw_data()
 
 
 # ── Serve Frontend Static Files ──────────────────────────────

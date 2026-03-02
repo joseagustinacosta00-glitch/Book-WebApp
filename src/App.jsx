@@ -34,6 +34,11 @@ function isUSHoliday(ds){return US_HOLIDAY_MAP.has(ds);}
 function getNextBusinessDay(ds){let d=new Date(ds+"T12:00:00");do{d.setDate(d.getDate()+1);}while(!isBusinessDay(fmtD(d)));return fmtD(d);}
 function fmtD(d){return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0");}
 function fmtDD(ds){if(!ds)return"";const[y,m,d]=ds.split("-");return d+"/"+m+"/"+y;}
+function isAfterMarketHours(){
+  // Argentina is UTC-3. Market closes at 17:00 AR time.
+  const now=new Date();const utcH=now.getUTCHours();const arH=((utcH-3)+24)%24;
+  return arH>=17;
+}
 function getUpcomingUS(ds,n=7){
   const base=new Date(ds+"T12:00:00"),r=[];
   for(const h of[...HOLIDAYS_US_2026,...EARLY_CLOSE_US_2026]){const dd=Math.ceil((new Date(h.date+"T12:00:00")-base)/864e5);if(dd>0&&dd<=n)r.push({...h,daysAway:dd});}
@@ -161,6 +166,7 @@ export default function App(){
     {id:"posicion",label:"Posición & PNL",icon:"\u{1F4B0}"},
     {id:"mercado",label:"Mercado",icon:"\u{1F4E1}"},
     {id:"tasas",label:"Tasas",icon:"\u{1F4C8}"},
+    {id:"precios",label:"Precios",icon:"\u{1F4B0}"},
     {id:"bonosvencidos",label:"Bonos Vencidos",icon:"\u{1F4C5}"},
   ];
 
@@ -188,6 +194,7 @@ export default function App(){
         {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas} bonosVencidos={bonosVencidos}/>}
         {tab==="mercado"&&<Mercado/>}
         {tab==="tasas"&&<TasasFondeo tasas={tasas} setTasas={setTasas}/>}
+        {tab==="precios"&&<PreciosManuales manualPrices={manualPrices} setManualPrices={setManualPrices}/>}
         {tab==="bonosvencidos"&&<BonosVencidos bonosVencidos={bonosVencidos} setBonosVencidos={setBonosVencidos}/>}
       </main>
     </div>
@@ -767,7 +774,7 @@ function NewOpRow({allTickers,onAdd}){
     return[...starts,...contains].slice(0,5);
   },[ticker,allTickers]);
 
-  // Parse PX: user types digits and optionally a comma for decimals
+  // Parse PX: user types digits and optionally a comma/dot for decimals
   // Display with dots for thousands: 1.234,56
   const pxNum=useMemo(()=>{
     if(!pxRaw)return 0;
@@ -776,17 +783,30 @@ function NewOpRow({allTickers,onAdd}){
   },[pxRaw]);
 
   const handlePxChange=(e)=>{
-    // Allow digits, one comma for decimals, dots for thousands (we format them)
     let v=e.target.value;
-    // Strip everything except digits and comma
-    v=v.replace(/[^0-9,]/g,"");
+    // Convert dot to comma (accept both as decimal sep)
+    // But preserve dots used as thousands separator by user
+    // Strategy: if there's a dot and no comma, treat last dot as decimal
+    v=v.replace(/[^0-9.,]/g,"");
+    // If user types a dot, convert to comma (decimal)
+    // Replace all dots with empty first, then handle
+    const dots=v.split(".").length-1;
+    const commas=v.split(",").length-1;
+    if(dots>0&&commas===0){
+      // User used dot as decimal: replace last dot with comma, remove others
+      const lastDot=v.lastIndexOf(".");
+      v=v.slice(0,lastDot).replace(/\./g,"")+","+v.slice(lastDot+1);
+    }else{
+      // Strip dots (thousands), keep comma as decimal
+      v=v.replace(/\./g,"");
+    }
     // Only one comma allowed
     const parts=v.split(",");
     if(parts.length>2)v=parts[0]+","+parts.slice(1).join("");
-    // Limit decimals to 2
-    if(parts.length===2&&parts[1].length>2)v=parts[0]+","+parts[1].slice(0,2);
+    // Limit decimals to 4 (prices like 0,7250)
+    if(parts.length===2&&parts[1].length>4)v=parts[0]+","+parts[1].slice(0,4);
     // Format integer part with dots
-    const intPart=parts[0].replace(/^0+(?=\d)/,"");
+    const intPart=(parts[0]||"").replace(/^0+(?=\d)/,"");
     const formatted=intPart.replace(/\B(?=(\d{3})+(?!\d))/g,".");
     setPxRaw(parts.length===2?formatted+","+parts[1]:formatted);
   };
@@ -1198,12 +1218,12 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
   const today=fmtD(new Date());
   const[mktPrices,setMktPrices]=useState({});
   const[mktLoading,setMktLoading]=useState(false);
-  const[manualPrices,setManualPrices]=useState(()=>loadS("manualPx",{}));// ticker -> price
-  const[priceSource,setPriceSource]=useState("byma");// "byma" | "manual"
+  const[manualPrices,setManualPrices]=useState(()=>loadS("manualPx2",{}));// ticker -> [{date,price}] sorted by date
+  const[priceSource,setPriceSource]=useState("byma");// "byma" | "mae" | "manual"
   const[editingPx,setEditingPx]=useState(null);// ticker being edited
   const[editPxVal,setEditPxVal]=useState("");
 
-  useEffect(()=>{saveS("manualPx",manualPrices);},[manualPrices]);
+  useEffect(()=>{saveS("manualPx2",manualPrices);},[manualPrices]);
 
   // Build maturity price lookup: ticker -> {px, date}
   const maturityMap=useMemo(()=>{
@@ -1213,6 +1233,27 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
     }
     return m;
   },[bonosVencidos]);
+
+  // Fetch market prices based on source
+  // After 17hs AR time: use cached prices, don't refetch BYMA (avoids errors)
+  const fetchMarketPrices=async()=>{
+    const tickers=pnlByTicker.map(p=>p.ticker).filter(t=>t);
+    if(tickers.length===0)return;
+    if(priceSource==="byma"&&isAfterMarketHours()&&Object.keys(mktPrices).length>0)return;// keep cached
+    setMktLoading(true);
+    try{
+      const endpoint=priceSource==="mae"?"/api/mae/quotes":"/api/byma/quotes";
+      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(tickers.join(",")));
+      const data=await r.json();
+      const syms=data.symbols||{};
+      // Only update if we got actual data (not all errors)
+      const hasData=Object.values(syms).some(v=>v.vwap!=null||v.last!=null);
+      if(hasData||Object.keys(mktPrices).length===0)setMktPrices(syms);
+    }catch(e){console.warn("PNL market fetch error",e);}
+    setMktLoading(false);
+  };
+
+  useEffect(()=>{if(pnlByTicker.length>0)fetchMarketPrices();},[pnlByTicker.length,priceSource]);
 
   // Build tasa lookup: date -> {rate, calDays}
   // calDays = calendar days this rate covers (until next business day)
@@ -1301,21 +1342,6 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
     }).sort((a,b)=>a.ticker.localeCompare(b.ticker));
   },[arsOpsWithCarry]);
 
-  // Fetch BYMA market prices
-  const fetchMarketPrices=async()=>{
-    const tickers=pnlByTicker.map(p=>p.ticker).filter(t=>t);
-    if(tickers.length===0)return;
-    setMktLoading(true);
-    try{
-      const r=await fetch("/api/byma/quotes?symbols="+encodeURIComponent(tickers.join(",")));
-      const data=await r.json();
-      setMktPrices(data.symbols||{});
-    }catch(e){console.warn("PNL market fetch error",e);}
-    setMktLoading(false);
-  };
-
-  useEffect(()=>{if(pnlByTicker.length>0)fetchMarketPrices();},[pnlByTicker.length]);
-
   // FX consolidated
   const fxPos=useMemo(()=>{
     const saldos={ARS:0,MEP:0,Cable:0};
@@ -1351,31 +1377,36 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
   },[operations]);
 
   // Resolve price for a ticker based on source
+  // Market VWAP (BYMA/MAE) is per VN=1. VTO/Manual are in % of VN.
   const getPrice=(ticker)=>{
     const mat=maturityMap[ticker.toUpperCase()];
-    if(mat)return{px:mat.px,src:"VTO"};
+    if(mat)return{px:mat.px,src:"VTO",isMkt:false};
     if(priceSource==="manual"){
-      const mp=manualPrices[ticker];
-      if(mp!=null)return{px:mp,src:"MANUAL"};
-      return{px:null,src:"—"};
+      const hist=manualPrices[ticker];
+      if(hist&&hist.length>0){const last=hist[hist.length-1];return{px:last.price,src:"MANUAL",isMkt:false};}
+      return{px:null,src:"—",isMkt:false};
     }
     const mkt=mktPrices[ticker];
-    if(mkt?.vwap!=null)return{px:mkt.vwap,src:"BYMA"};
-    if(mkt?.last!=null)return{px:mkt.last,src:"BYMA"};
+    const srcLabel=priceSource==="mae"?"MAE":"BYMA";
+    if(mkt?.vwap!=null)return{px:mkt.vwap,src:srcLabel,isMkt:true};
+    if(mkt?.last!=null)return{px:mkt.last,src:srcLabel,isMkt:true};
     // Fallback to manual if available
-    const mp=manualPrices[ticker];
-    if(mp!=null)return{px:mp,src:"MANUAL"};
-    return{px:null,src:mkt?.error?"ERR":"—"};
+    const hist=manualPrices[ticker];
+    if(hist&&hist.length>0){const last=hist[hist.length-1];return{px:last.price,src:"MANUAL",isMkt:false};}
+    return{px:null,src:mkt?.error?"ERR":"—",isMkt:false};
   };
 
   // PNL totals
+  // Market VWAP is per VN=1: valMkt = px * |vnNet|
+  // VTO/Manual are %: valMkt = (px/100) * |vnNet|
+  // Cost is always %: valCost = (vwapCost/100) * |vnNet|
   const pnlTotal=useMemo(()=>{
     let totalPnl=0;
     for(const p of pnlByTicker){
-      const{px}=getPrice(p.ticker);
+      const{px,isMkt}=getPrice(p.ticker);
       if(px!=null&&p.vnNet!==0){
-        const valMkt=(px/100)*Math.abs(p.vnNet);
         const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
+        const valMkt=isMkt?(px*Math.abs(p.vnNet)):((px/100)*Math.abs(p.vnNet));
         const pnl=p.vnNet>0?(valMkt-valCost):(valCost-valMkt);
         totalPnl+=pnl;
       }
@@ -1385,7 +1416,7 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
 
   const cellS={padding:"10px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
   const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
-  const fmtPx=(v)=>v!=null?Number(v).toFixed(2):"—";
+  const fmtPx=(v)=>v!=null?Number(v).toFixed(4):"—";
 
   return(
     <div>
@@ -1418,7 +1449,7 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
         <div style={{background:"#111827",borderRadius:12,border:`1px solid ${pnlTotal>=0?"rgba(72,187,120,0.2)":"rgba(252,129,129,0.2)"}`,padding:"16px 20px"}}>
           <div style={{fontSize:10,color:"#718096",textTransform:"uppercase",letterSpacing:"0.5px",marginBottom:6}}>PNL Total Títulos ARS</div>
           <div style={{fontSize:28,fontWeight:800,color:pnlTotal===0?"#4a5568":pnlTotal>0?"#68d391":"#fc8181",fontVariantNumeric:"tabular-nums"}}>{fmtMoney(pnlTotal)}</div>
-          <div style={{fontSize:10,color:"#4a5568",marginTop:4}}>Costo ajustado por fondeo vs VWAP BYMA</div>
+          <div style={{fontSize:10,color:"#4a5568",marginTop:4}}>Costo ajustado por fondeo vs {priceSource==="manual"?"precios manuales":priceSource==="mae"?"VWAP MAE":"VWAP BYMA"}</div>
         </div>
       </div>
 
@@ -1429,8 +1460,9 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
           <div style={{display:"flex",gap:8,alignItems:"center"}}>
             <span style={{fontSize:10,color:"#718096"}}>Precio:</span>
             <button onClick={()=>setPriceSource("byma")} style={{padding:"4px 12px",borderRadius:4,border:priceSource==="byma"?"1px solid #ed8936":"1px solid rgba(99,179,237,0.15)",background:priceSource==="byma"?"rgba(237,137,54,0.15)":"transparent",color:priceSource==="byma"?"#ed8936":"#718096",fontSize:10,fontWeight:priceSource==="byma"?700:400,cursor:"pointer",fontFamily:"inherit"}}>BYMA Open</button>
+            <button onClick={()=>setPriceSource("mae")} style={{padding:"4px 12px",borderRadius:4,border:priceSource==="mae"?"1px solid #68d391":"1px solid rgba(99,179,237,0.15)",background:priceSource==="mae"?"rgba(104,211,145,0.15)":"transparent",color:priceSource==="mae"?"#68d391":"#718096",fontSize:10,fontWeight:priceSource==="mae"?700:400,cursor:"pointer",fontFamily:"inherit"}}>MAE</button>
             <button onClick={()=>setPriceSource("manual")} style={{padding:"4px 12px",borderRadius:4,border:priceSource==="manual"?"1px solid #b794f4":"1px solid rgba(99,179,237,0.15)",background:priceSource==="manual"?"rgba(183,148,244,0.15)":"transparent",color:priceSource==="manual"?"#b794f4":"#718096",fontSize:10,fontWeight:priceSource==="manual"?700:400,cursor:"pointer",fontFamily:"inherit"}}>Manual</button>
-            {priceSource==="byma"&&<button onClick={fetchMarketPrices} disabled={mktLoading} style={{padding:"4px 12px",borderRadius:4,border:"1px solid rgba(237,137,54,0.2)",background:"rgba(237,137,54,0.1)",color:"#ed8936",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{mktLoading?"...":"↻ Refresh"}</button>}
+            {priceSource!=="manual"&&<button onClick={fetchMarketPrices} disabled={mktLoading} style={{padding:"4px 12px",borderRadius:4,border:"1px solid rgba(99,179,237,0.2)",background:"rgba(49,130,206,0.1)",color:"#63b3ed",fontSize:10,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>{mktLoading?"...":"↻ Refresh"}</button>}
           </div>
         </div>
         {pnlByTicker.length===0?(
@@ -1450,9 +1482,9 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
             </thead>
             <tbody>
               {pnlByTicker.map(p=>{
-                const{px:vwapMkt,src}=getPrice(p.ticker);
+                const{px:vwapMkt,src,isMkt}=getPrice(p.ticker);
                 const valCost=(p.vwapCost/100)*Math.abs(p.vnNet);
-                const valMkt=vwapMkt!=null?(vwapMkt/100)*Math.abs(p.vnNet):null;
+                const valMkt=vwapMkt!=null?(isMkt?(vwapMkt*Math.abs(p.vnNet)):((vwapMkt/100)*Math.abs(p.vnNet))):null;
                 const pnl=valMkt!=null?(p.vnNet>0?(valMkt-valCost):(valCost-valMkt)):null;
                 const isEditingThis=editingPx===p.ticker;
                 const srcColor=src==="VTO"?"#ed8936":src==="MANUAL"?"#b794f4":src==="BYMA"?"#68d391":"#4a5568";
@@ -1464,9 +1496,9 @@ function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
                     <td style={{...cellS,textAlign:"right"}}>
                       {isEditingThis?(
                         <input value={editPxVal} onChange={e=>setEditPxVal(e.target.value)} onKeyDown={e=>{
-                          if(e.key==="Enter"){const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){setManualPrices(prev=>({...prev,[p.ticker]:v}));}setEditingPx(null);}
+                          if(e.key==="Enter"){const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){const d=fmtD(new Date());setManualPrices(prev=>{const arr=[...(prev[p.ticker]||[])].filter(x=>x.date!==d);arr.push({date:d,price:v});arr.sort((a,b)=>a.date.localeCompare(b.date));return{...prev,[p.ticker]:arr};});}setEditingPx(null);}
                           if(e.key==="Escape")setEditingPx(null);
-                        }} onBlur={()=>{const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){setManualPrices(prev=>({...prev,[p.ticker]:v}));}setEditingPx(null);}}
+                        }} onBlur={()=>{const v=parseFloat(editPxVal.replace(",","."));if(!isNaN(v)){const d=fmtD(new Date());setManualPrices(prev=>{const arr=[...(prev[p.ticker]||[])].filter(x=>x.date!==d);arr.push({date:d,price:v});arr.sort((a,b)=>a.date.localeCompare(b.date));return{...prev,[p.ticker]:arr};});}setEditingPx(null);}}
                         autoFocus style={{padding:"3px 6px",background:"#1a2332",border:"1px solid #b794f4",borderRadius:4,color:"#b794f4",fontSize:12,fontFamily:"inherit",outline:"none",width:70,textAlign:"right"}}/>
                       ):(
                         <span style={{cursor:"pointer",color:vwapMkt!=null?srcColor:"#4a5568",fontWeight:600}} onClick={()=>{setEditingPx(p.ticker);setEditPxVal(vwapMkt!=null?String(vwapMkt):"");}}>
@@ -1534,6 +1566,7 @@ function Mercado(){
   const[lastUpdate,setLastUpdate]=useState(null);
   const[cauciones,setCauciones]=useState(null);
   const[caucionLoading,setCaucionLoading]=useState(false);
+  const[mktSource,setMktSource]=useState("byma");// "byma" | "mae"
 
   const isTasa=activeCurve==="tasa";
 
@@ -1541,17 +1574,26 @@ function Mercado(){
     if(isTasa){fetchCauciones();return;}
     const syms=curves[activeCurve].symbols.map(s=>s.rofexTicker).join(",");
     if(!syms)return;
+    // After 17hs AR: if BYMA and we already have quotes, don't refetch
+    if(mktSource==="byma"&&isAfterMarketHours()&&Object.keys(quotes).length>0){setStatus("ok");return;}
     setStatus("loading");setErrorMsg("");
     try{
-      const r=await fetch("/api/byma/quotes?symbols="+encodeURIComponent(syms));
+      const endpoint=mktSource==="mae"?"/api/mae/quotes":"/api/byma/quotes";
+      const r=await fetch(endpoint+"?symbols="+encodeURIComponent(syms));
       const data=await r.json();
       const symsData=data.symbols||{};
-      setQuotes(symsData);setLastUpdate(new Date());
+      // Only update if we got actual data
+      const hasData=Object.values(symsData).some(v=>v.vwap!=null||v.last!=null);
+      if(hasData||Object.keys(quotes).length===0){setQuotes(symsData);setLastUpdate(new Date());}
       const vals=Object.values(symsData);
       const allErrors=vals.length>0&&vals.every(v=>v.error);
+      if(allErrors&&Object.keys(quotes).length>0){setStatus("ok");return;}// keep old data
       if(allErrors){setStatus("error");setErrorMsg(vals[0]?.error||"Error desconocido");return;}
       setStatus("ok");
-    }catch(e){setStatus("error");setErrorMsg(e.message||"Error de conexión");}
+    }catch(e){
+      if(Object.keys(quotes).length>0){setStatus("ok");return;}// keep old data
+      setStatus("error");setErrorMsg(e.message||"Error de conexión");
+    }
   };
 
   const fetchCauciones=async()=>{
@@ -1566,7 +1608,7 @@ function Mercado(){
     setCaucionLoading(false);
   };
 
-  useEffect(()=>{fetchQuotes();},[activeCurve]);
+  useEffect(()=>{fetchQuotes();},[activeCurve,mktSource]);
 
   const statusColor=status==="ok"?"#48bb78":status==="error"?"#fc8181":status==="loading"?"#f6e05e":"#a0aec0";
   const cellS={padding:"8px 12px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
@@ -1576,22 +1618,34 @@ function Mercado(){
 
   return(
     <div style={{maxWidth:1100,margin:"0 auto"}}>
-      {/* BYMA delay banner */}
+      {/* Source banner */}
       {!isTasa&&(
-        <div style={{marginBottom:16,padding:"10px 20px",background:"rgba(237,137,54,0.08)",border:"1px solid rgba(237,137,54,0.2)",borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
-          <span style={{fontSize:16}}>⏱️</span>
-          <div style={{fontSize:12,color:"#ed8936",fontWeight:600}}>BYMA Open — Datos con delay ~20 min</div>
+        <div style={{marginBottom:16,padding:"10px 20px",background:mktSource==="mae"?"rgba(104,211,145,0.08)":"rgba(237,137,54,0.08)",border:`1px solid ${mktSource==="mae"?"rgba(104,211,145,0.2)":"rgba(237,137,54,0.2)"}`,borderRadius:8,display:"flex",alignItems:"center",gap:10}}>
+          <span style={{fontSize:16}}>{mktSource==="mae"?"📊":"⏱️"}</span>
+          <div style={{fontSize:12,color:mktSource==="mae"?"#68d391":"#ed8936",fontWeight:600}}>
+            {mktSource==="mae"?"MAE Market Data — API con credenciales":"BYMA Open — Datos con delay ~20 min"}
+            {mktSource==="byma"&&isAfterMarketHours()&&<span style={{marginLeft:8,fontSize:10,color:"#718096"}}>(fuera de rueda — precios de cierre)</span>}
+          </div>
         </div>
       )}
 
-      {/* Curve tabs */}
-      <div style={{display:"flex",gap:4,marginBottom:16,flexWrap:"wrap"}}>
-        {curveKeys.map(k=>(
+      {/* Source + Curve tabs */}
+      <div style={{display:"flex",gap:16,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+        {!isTasa&&(
+          <div style={{display:"flex",gap:4,alignItems:"center",padding:"4px 6px",background:"rgba(99,179,237,0.04)",borderRadius:6,border:"1px solid rgba(99,179,237,0.08)"}}>
+            <span style={{fontSize:10,color:"#718096",marginRight:4}}>Fuente:</span>
+            <button onClick={()=>setMktSource("byma")} style={{padding:"4px 10px",borderRadius:4,border:mktSource==="byma"?"1px solid #ed8936":"1px solid rgba(99,179,237,0.15)",background:mktSource==="byma"?"rgba(237,137,54,0.15)":"transparent",color:mktSource==="byma"?"#ed8936":"#718096",fontSize:10,fontWeight:mktSource==="byma"?700:400,cursor:"pointer",fontFamily:"inherit"}}>BYMA Open</button>
+            <button onClick={()=>setMktSource("mae")} style={{padding:"4px 10px",borderRadius:4,border:mktSource==="mae"?"1px solid #68d391":"1px solid rgba(99,179,237,0.15)",background:mktSource==="mae"?"rgba(104,211,145,0.15)":"transparent",color:mktSource==="mae"?"#68d391":"#718096",fontSize:10,fontWeight:mktSource==="mae"?700:400,cursor:"pointer",fontFamily:"inherit"}}>MAE</button>
+          </div>
+        )}
+        <div style={{display:"flex",gap:4}}>
+          {curveKeys.map(k=>(
           <button key={k} onClick={()=>setActiveCurve(k)}
             style={{padding:"8px 18px",borderRadius:6,border:activeCurve===k?"1px solid #3182ce":"1px solid rgba(99,179,237,0.15)",background:activeCurve===k?"rgba(49,130,206,0.15)":"transparent",color:activeCurve===k?"#63b3ed":"#a0aec0",fontWeight:activeCurve===k?600:400,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>
             {curveLabels[k]}
           </button>
         ))}
+        </div>
       </div>
 
       {/* Controls */}
@@ -1830,6 +1884,155 @@ function TasasFondeo({tasas,setTasas}){
             {sorted.length===0&&(
               <tr><td colSpan={3} style={{...cellS,textAlign:"center",color:"#4a5568",padding:30}}>No hay tasas registradas</td></tr>
             )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// PRECIOS MANUALES - Base de datos de precios día por día
+// ============================================================
+function PreciosManuales({manualPrices,setManualPrices}){
+  const today=fmtD(new Date());
+  const[newTicker,setNewTicker]=useState("");
+  const[newDate,setNewDate]=useState(today);
+  const[newPx,setNewPx]=useState("");
+  const[filterTicker,setFilterTicker]=useState("");
+  const[editKey,setEditKey]=useState(null);// "ticker|date"
+  const[editVal,setEditVal]=useState("");
+
+  // All tickers that have manual prices
+  const tickers=useMemo(()=>Object.keys(manualPrices).sort(),[manualPrices]);
+
+  // Filtered view: all entries flattened, sorted by date desc then ticker
+  const allEntries=useMemo(()=>{
+    const entries=[];
+    for(const[ticker,arr]of Object.entries(manualPrices)){
+      if(filterTicker&&!ticker.toUpperCase().includes(filterTicker.toUpperCase()))continue;
+      for(const e of arr){
+        entries.push({ticker,date:e.date,price:e.price});
+      }
+    }
+    entries.sort((a,b)=>b.date.localeCompare(a.date)||a.ticker.localeCompare(b.ticker));
+    return entries;
+  },[manualPrices,filterTicker]);
+
+  // Last price per ticker for quick view
+  const lastPrices=useMemo(()=>{
+    const m={};
+    for(const[ticker,arr]of Object.entries(manualPrices)){
+      if(arr.length>0)m[ticker]=arr[arr.length-1];
+    }
+    return m;
+  },[manualPrices]);
+
+  const addPrice=()=>{
+    const ticker=newTicker.trim().toUpperCase();
+    if(!ticker||!newDate||!newPx)return;
+    const price=parseFloat(newPx.replace(",","."));
+    if(isNaN(price))return;
+    setManualPrices(prev=>{
+      const arr=[...(prev[ticker]||[])].filter(x=>x.date!==newDate);
+      arr.push({date:newDate,price});
+      arr.sort((a,b)=>a.date.localeCompare(b.date));
+      return{...prev,[ticker]:arr};
+    });
+    setNewPx("");
+  };
+
+  const removeEntry=(ticker,date)=>{
+    setManualPrices(prev=>{
+      const arr=(prev[ticker]||[]).filter(x=>x.date!==date);
+      if(arr.length===0){const{[ticker]:_,...rest}=prev;return rest;}
+      return{...prev,[ticker]:arr};
+    });
+  };
+
+  const saveEdit=(ticker,date)=>{
+    const v=parseFloat(editVal.replace(",","."));
+    if(!isNaN(v)){
+      setManualPrices(prev=>{
+        const arr=(prev[ticker]||[]).map(x=>x.date===date?{...x,price:v}:x);
+        return{...prev,[ticker]:arr};
+      });
+    }
+    setEditKey(null);
+  };
+
+  const cellS={padding:"8px 14px",fontSize:12,borderBottom:"1px solid rgba(99,179,237,0.06)"};
+  const hdS={...cellS,fontWeight:600,color:"#718096",fontSize:10,letterSpacing:"0.5px",textTransform:"uppercase",background:"#0d1220"};
+
+  return(
+    <div>
+      <div style={{marginBottom:20,fontSize:14,color:"#a0aec0"}}>Base de precios manual — registrá precios por ticker y fecha. En PNL modo "Manual" usa el último precio cargado.</div>
+
+      {/* Last prices summary */}
+      {tickers.length>0&&(
+        <div style={{marginBottom:16,display:"flex",gap:8,flexWrap:"wrap"}}>
+          {tickers.map(t=>{const lp=lastPrices[t];return lp?(
+            <div key={t} style={{padding:"6px 12px",background:"rgba(183,148,244,0.08)",border:"1px solid rgba(183,148,244,0.15)",borderRadius:6,display:"flex",gap:8,alignItems:"center"}}>
+              <span style={{fontSize:11,fontWeight:700,color:"#b794f4"}}>{t}</span>
+              <span style={{fontSize:12,fontWeight:600,color:"#f7fafc"}}>{lp.price.toFixed(4)}</span>
+              <span style={{fontSize:9,color:"#718096"}}>{fmtDD(lp.date)}</span>
+            </div>
+          ):null;})}
+        </div>
+      )}
+
+      {/* Add new price */}
+      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",padding:16,marginBottom:20}}>
+        <div style={{fontSize:11,fontWeight:600,color:"#b794f4",marginBottom:10}}>Agregar precio</div>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <input value={newTicker} onChange={e=>setNewTicker(e.target.value.toUpperCase())} placeholder="Ticker" style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",width:120}} onKeyDown={e=>e.key==="Enter"&&addPrice()}/>
+          <input type="date" value={newDate} onChange={e=>setNewDate(e.target.value)} style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none"}}/>
+          <input value={newPx} onChange={e=>setNewPx(e.target.value)} placeholder="Precio" style={{padding:"8px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:12,fontFamily:"inherit",outline:"none",width:100,textAlign:"right"}} onKeyDown={e=>e.key==="Enter"&&addPrice()}/>
+          <button onClick={addPrice} disabled={!newTicker||!newDate||!newPx} style={{padding:"8px 16px",borderRadius:6,border:"none",background:newTicker&&newDate&&newPx?"linear-gradient(135deg,#805ad5,#b794f4)":"#2d3748",color:newTicker&&newDate&&newPx?"#fff":"#4a5568",fontSize:11,fontWeight:700,cursor:newTicker&&newDate&&newPx?"pointer":"not-allowed",fontFamily:"inherit"}}>Agregar</button>
+        </div>
+        <div style={{fontSize:10,color:"#4a5568",marginTop:6}}>Si el ticker+fecha ya existe, se sobreescribe el precio</div>
+      </div>
+
+      {/* Filter */}
+      <div style={{marginBottom:12,display:"flex",gap:8,alignItems:"center"}}>
+        <input value={filterTicker} onChange={e=>setFilterTicker(e.target.value)} placeholder="Filtrar ticker..." style={{padding:"6px 12px",background:"#1a2332",border:"1px solid rgba(99,179,237,0.15)",borderRadius:6,color:"#f7fafc",fontSize:11,fontFamily:"inherit",outline:"none",width:160}}/>
+        <span style={{fontSize:10,color:"#4a5568"}}>{allEntries.length} entradas{filterTicker?` (filtrado: ${filterTicker})`:""}</span>
+      </div>
+
+      {/* Table */}
+      <div style={{background:"#111827",borderRadius:12,border:"1px solid rgba(99,179,237,0.1)",overflow:"hidden"}}>
+        <table style={{width:"100%",borderCollapse:"collapse"}}>
+          <thead>
+            <tr>
+              <th style={hdS}>Ticker</th>
+              <th style={hdS}>Fecha</th>
+              <th style={{...hdS,textAlign:"right"}}>Precio</th>
+              <th style={{...hdS,textAlign:"center",width:60}}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {allEntries.length===0?(
+              <tr><td colSpan={4} style={{...cellS,textAlign:"center",color:"#4a5568"}}>Sin precios cargados</td></tr>
+            ):allEntries.slice(0,200).map(e=>{
+              const key=e.ticker+"|"+e.date;
+              const isEd=editKey===key;
+              return(
+                <tr key={key} style={{transition:"background 0.15s"}} onMouseEnter={ev=>ev.currentTarget.style.background="rgba(99,179,237,0.04)"} onMouseLeave={ev=>ev.currentTarget.style.background="transparent"}>
+                  <td style={{...cellS,fontWeight:600,color:"#b794f4"}}>{e.ticker}</td>
+                  <td style={{...cellS,color:"#a0aec0"}}>{fmtDD(e.date)}</td>
+                  <td style={{...cellS,textAlign:"right"}}>
+                    {isEd?(
+                      <input value={editVal} onChange={ev=>setEditVal(ev.target.value)} onKeyDown={ev=>{if(ev.key==="Enter")saveEdit(e.ticker,e.date);if(ev.key==="Escape")setEditKey(null);}} onBlur={()=>saveEdit(e.ticker,e.date)} autoFocus style={{padding:"3px 6px",background:"#1a2332",border:"1px solid #b794f4",borderRadius:4,color:"#b794f4",fontSize:12,fontFamily:"inherit",outline:"none",width:80,textAlign:"right"}}/>
+                    ):(
+                      <span style={{cursor:"pointer",fontWeight:600,color:"#f7fafc"}} onClick={()=>{setEditKey(key);setEditVal(String(e.price));}}>{e.price.toFixed(4)}</span>
+                    )}
+                  </td>
+                  <td style={{...cellS,textAlign:"center"}}>
+                    <button onClick={()=>removeEntry(e.ticker,e.date)} style={{background:"none",border:"none",color:"#fc8181",cursor:"pointer",fontSize:13,fontFamily:"inherit",padding:2}} title="Eliminar">\u2715</button>
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
