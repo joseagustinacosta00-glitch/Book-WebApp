@@ -151,11 +151,13 @@ export default function App(){
   const[fxOps,setFxOps]=useState(()=>loadS("fx1",[]));
   const[tasas,setTasas]=useState(()=>loadS("tasas1",INIT_TASAS));
   const[bonosVencidos,setBonosVencidos]=useState(()=>loadS("bv1",[]));
+  const[manualPrices,setManualPrices]=useState(()=>loadS("manualPx2",{}));// ticker -> [{date,price}]
   useEffect(()=>{saveS("i1",instruments);},[instruments]);
   useEffect(()=>{saveS("o1",operations);},[operations]);
   useEffect(()=>{saveS("fx1",fxOps);},[fxOps]);
   useEffect(()=>{saveS("tasas1",tasas);},[tasas]);
   useEffect(()=>{saveS("bv1",bonosVencidos);},[bonosVencidos]);
+  useEffect(()=>{saveS("manualPx2",manualPrices);},[manualPrices]);
   const allTickers=useMemo(()=>{const l=[];Object.entries(instruments).forEach(([f,its])=>{if(f==="Monedas")return;its.forEach(i=>l.push({...i,family:f}));});return l;},[instruments]);
 
   const tabs=[
@@ -191,7 +193,7 @@ export default function App(){
         {tab==="blotter"&&<Blotter operations={operations} setOperations={setOperations} fxOps={fxOps} setFxOps={setFxOps} allTickers={allTickers}/>}
         {tab==="auditoria"&&<Auditoria operations={operations} fxOps={fxOps}/>}
         {tab==="instrumentos"&&<BaseInstrumentos instruments={instruments} setInstruments={setInstruments}/>}
-        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas} bonosVencidos={bonosVencidos}/>}
+        {tab==="posicion"&&<PosicionPNL operations={operations} fxOps={fxOps} tasas={tasas} bonosVencidos={bonosVencidos} manualPrices={manualPrices} setManualPrices={setManualPrices}/>}
         {tab==="mercado"&&<Mercado/>}
         {tab==="tasas"&&<TasasFondeo tasas={tasas} setTasas={setTasas}/>}
         {tab==="precios"&&<PreciosManuales manualPrices={manualPrices} setManualPrices={setManualPrices}/>}
@@ -1214,16 +1216,13 @@ function Auditoria({operations,fxOps}){
 // ============================================================
 // POSICIÓN & PNL — Consolidated position across all dates
 // ============================================================
-function PosicionPNL({operations,fxOps,tasas,bonosVencidos}){
+function PosicionPNL({operations,fxOps,tasas,bonosVencidos,manualPrices,setManualPrices}){
   const today=fmtD(new Date());
   const[mktPrices,setMktPrices]=useState({});
   const[mktLoading,setMktLoading]=useState(false);
-  const[manualPrices,setManualPrices]=useState(()=>loadS("manualPx2",{}));// ticker -> [{date,price}] sorted by date
   const[priceSource,setPriceSource]=useState("byma");// "byma" | "mae" | "manual"
   const[editingPx,setEditingPx]=useState(null);// ticker being edited
   const[editPxVal,setEditPxVal]=useState("");
-
-  useEffect(()=>{saveS("manualPx2",manualPrices);},[manualPrices]);
 
   // Build maturity price lookup: ticker -> {px, date}
   const maturityMap=useMemo(()=>{
